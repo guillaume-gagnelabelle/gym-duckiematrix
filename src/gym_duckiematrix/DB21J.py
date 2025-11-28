@@ -36,6 +36,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.lp_cal = LanePositionCalculator(map_interpreter=self.map_int)
         self.out_of_road_penalty = out_of_road_penalty
         self.last_pose = None
+        self.info : Dict = {}
 
     def initialize_sensors(self):
         self.robot.camera.start()
@@ -111,30 +112,12 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.fig.canvas.draw_idle()
         self.fig.canvas.start_event_loop(0.00001)
 
+        self.info = {"pose": pose}
         info = self._get_info()
         return rgb, reward, terminated, False, info
 
     def reset(self, position: Tuple[float, float, float] | None = None):
-        print("Resetting environment...")
-        print(position)
-        """Reset the environment.
-
-        If ``position`` is provided it should be a tuple (x, y, yaw).
-
-        NOTE: In some simulator integrations it may not be possible to
-        teleport the simulated robot purely from the client side. When a
-        physical teleport is not supported this method will set the
-        environment's internal ``last_pose`` so that the next step and
-        reward calculations use the provided starting pose. If your
-        simulator supports programmatic teleportation you can extend this
-        method to publish a layer/state update to the engine before
-        calling the reset flag.
-        """
-        # If a desired starting position is provided, try to synthesize a
-        # pose dictionary compatible with the usual pose messages so the
-        # environment's internal bookkeeping (reward, last_pose, etc.)
-        # starts from that point. This does NOT necessarily move the
-        # simulated robot in the engine — see the NOTE above.
+        
         if position is not None:
             x, y, yaw = position
             # construct a minimal pose dict similar to the one produced by
@@ -162,6 +145,10 @@ class DuckiematrixDB21JEnv(gym.Env):
                 rotation=rotation_msg,
             )
             self.robot.pose_reset.set_pose(teleport)
+            # try to grab a fresh pose after requesting the reset
+            new_pose = self.robot.pose.capture(block=True, timeout=0.5)
+            if new_pose is not None:
+                self.last_pose = new_pose
 
         # perform the environment reset sequence used previously
         while True:
@@ -169,23 +156,25 @@ class DuckiematrixDB21JEnv(gym.Env):
             # a None capture; otherwise capture the real pose from the robot.
             if self.last_pose is None:
                 self.last_pose = self.robot.pose.capture()
+            else:
+                # try to update it with a new capture if available
+                newer_pose = self.robot.pose.capture()
+                if newer_pose is not None:
+                    self.last_pose = newer_pose
             if self.last_pose is not None:
                 break
 
         # Log the starting position to help users verify the reset
-        try:
-            x = self.last_pose["position"]["x"]
-            y = self.last_pose["position"]["y"]
-            z = self.last_pose["position"]["z"]
-            print("Intial robot position: ", x, y, z)
-        except Exception:
-            # best-effort logging, don't fail the reset if structure differs
-            pass
+        x = self.last_pose["position"]["x"]
+        y = self.last_pose["position"]["y"]
+        z = self.last_pose["position"]["z"]
+        print("Initial robot position: ", x, y, z)
 
         # inform the engine to reset the robot state (engine may or may not
         # act on this depending on its capabilities)
         self.robot.reset_flag.set_reset(True)
         obs = self.robot.camera.capture()
+        self.info = {"pose": self.last_pose}
         info = self._get_info()
         return obs, info
 
@@ -199,5 +188,4 @@ class DuckiematrixDB21JEnv(gym.Env):
         Returns:
             info (Dict): A info dictionary with info for each robot
         """
-        info : Dict = {}
-        return info
+        return self.info
