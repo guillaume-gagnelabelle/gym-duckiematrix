@@ -6,7 +6,10 @@ from duckietown_messages.geometry_3d import Transformation, Position, Quaternion
 from duckietown_messages.standard import Header
 from duckietown.sdk.robots.duckiebot import DB21J
 from duckietown.sdk.utils.lane_position import MapInterpreter, LanePositionCalculator
-from .utils import quaternion_to_euler
+from .utils import quaternion_to_euler, compute_yaw
+from duckietown.sdk.utils.loop_lane_position import is_out_of_lane, compute_d, compute_theta
+import math
+
 
 DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
@@ -14,13 +17,13 @@ DEFAULT_CAMERA_HEIGHT = 480
 
 class DuckiematrixDB21JEnv(gym.Env):
     def __init__(self, entity_name = "map_0/vehicle_0", out_of_road_penalty = -10.0):
-        import matplotlib.pyplot as plt
+        #import matplotlib.pyplot as plt
         # create matplot window
-        self.window = plt.imshow(np.zeros((DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3)))
-        plt.axis("off")
-        self.fig = plt.figure(1)
-        plt.subplots_adjust(left=0.0, right=1.0, top=1.0, bottom=0.0)
-        plt.pause(0.01)
+        #self.window = plt.imshow(np.zeros((DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3)))
+        #plt.axis("off")
+        #self.fig = plt.figure(1)
+        #plt.subplots_adjust(left=0.0, right=1.0, top=1.0, bottom=0.0)
+        #plt.pause(0.01)
 
         self._shutdown = False
         #create connection to the matrix engine
@@ -39,7 +42,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.info : Dict = {}
 
     def initialize_sensors(self):
-        self.robot.camera.start()
+        #self.robot.camera.start()
         self.robot.motors.start()
         self.robot.map_frames.start()
         self.robot.map_tiles.start()
@@ -67,29 +70,23 @@ class DuckiematrixDB21JEnv(gym.Env):
         return is_map               
         
         
-    def reward_fn(self, pose, last_pose):
-        terminated = False
-        if self.last_pose is not None:
-            delta_t = float(pose["header"]["timestamp"]) - float(self.last_pose["header"]["timestamp"])
+    def reward_fn(self, d, theta, action, delta_t):
+
+        if d > 0.585 / 2 or abs(theta) > math.pi / 2: # Assuming d and theta are computed correctly, then True implies the robots is out of lane or wrong direction
+            return self.out_of_road_penalty
         
-        x, y, z = pose["position"]["x"], pose["position"]["y"], pose["position"]["z"]
-        last_x, last_y, last_z = last_pose["position"]["x"], last_pose["position"]["y"], last_pose["position"]["z"]
-        # Calculate speed based on position change and time delta
-        dx = x - last_x
-        dy = y - last_y
-        dz = z - last_z
-        speed = np.sqrt(dx*dx + dy*dy + dz*dz) / delta_t if delta_t > 0 else 0.0
-        
-        quat_rot = [pose["rotation"]["w"], pose["rotation"]["x"], pose["rotation"]["y"], pose["rotation"]["z"]]
-        rot = quaternion_to_euler(quat_rot)
-        try:
-            lp = self.lp_cal.get_lane_pos2(np.array([x, y, z]), rot[-1])
-            reward = +1.0 * speed * lp.dot_dir + -10 * np.abs(lp.dist)
-        except Exception as e:
-            reward = self.out_of_road_penalty
-            terminated = True
-        
-        return reward, terminated
+        if delta_t is None or delta_t <= 0:
+            # If we are out of lane or cannot infer a sensible speed, penalize.
+            return 0.0
+
+        action_norm = float(np.linalg.norm(action))
+        speed_proxy = action_norm / delta_t
+
+        # Encourage forward alignment, discourage lateral/heading error.
+        alignment = max(0.0, math.cos(theta))
+        lane_penalty = 4.0 * abs(d) + 1.0 * abs(theta)
+
+        return speed_proxy * alignment - lane_penalty
 
     def step(self, actions : Tuple) -> Tuple:
         # TODO: this is a hack to simulate rad/s to PWM conversion
@@ -97,24 +94,34 @@ class DuckiematrixDB21JEnv(gym.Env):
         wr = actions[1]*0.4
 
         self.robot.motors.set_pwm(left=wl, right=wr)
-        bgr = self.robot.camera.capture()
+        #bgr = self.robot.camera.capture()
         
-        if bgr is None:
-            print("got no image.. skipping")
-            return None, None, None, None, None
+        #if bgr is None:
+        #    print("got no image.. skipping")
+        #    return None, None, None, None, None, None
         
         pose = self.robot.pose.capture()
-        reward, terminated = self.reward_fn(pose, self.last_pose)
+        delta_t = None
+        if self.last_pose is not None and pose is not None:
+            delta_t = float(pose["header"]["timestamp"]) - float(self.last_pose["header"]["timestamp"])
+
+        x, y, yaw = pose["position"]["x"], pose["position"]["y"], compute_yaw(pose)
+
+        d, theta = compute_d(x, y), compute_theta(x, y, yaw)
+        terminated = is_out_of_lane(x, y) or abs(theta) > math.pi / 2
+        reward = self.reward_fn(d, theta, actions, delta_t)
+
         self.last_pose = pose
 
-        rgb = bgr[:, :, [2,1,0]]
-        self.window.set_data(rgb)
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.start_event_loop(0.00001)
+        #rgb = bgr[:, :, [2,1,0]]
+        #self.window.set_data(rgb)
+        #self.fig.canvas.draw_idle()
+        #self.fig.canvas.start_event_loop(0.00001)
 
         self.info = {"pose": pose}
         info = self._get_info()
-        return rgb, reward, terminated, False, info
+        return (d, theta), reward, terminated, info
+        #return rgb, reward, terminated, d, theta, info
 
     def reset(self, position: Tuple[float, float, float] | None = None):
         
@@ -165,18 +172,15 @@ class DuckiematrixDB21JEnv(gym.Env):
                 break
 
         # Log the starting position to help users verify the reset
-        x = self.last_pose["position"]["x"]
-        y = self.last_pose["position"]["y"]
-        z = self.last_pose["position"]["z"]
-        print("Initial robot position: ", x, y, z)
+        print(f"Initial robot position: (x={round(x,2)}, y={round(y,2)}, yaw={round(yaw, 2)})")
 
         # inform the engine to reset the robot state (engine may or may not
         # act on this depending on its capabilities)
         self.robot.reset_flag.set_reset(True)
-        obs = self.robot.camera.capture()
+        #obs = self.robot.camera.capture()
         self.info = {"pose": self.last_pose}
         info = self._get_info()
-        return obs, info
+        return info
 
     def _get_reward(self) -> float:
         #TODO
