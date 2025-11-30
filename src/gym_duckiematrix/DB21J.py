@@ -7,7 +7,7 @@ from duckietown_messages.standard import Header
 from duckietown.sdk.robots.duckiebot import DB21J
 from duckietown.sdk.utils.lane_position import MapInterpreter, LanePositionCalculator
 from .utils import quaternion_to_euler, compute_yaw
-from duckietown.sdk.utils.loop_lane_position import is_out_of_lane, compute_d, compute_theta
+from duckietown.sdk.utils.loop_lane_position import is_out_of_lane, compute_d, compute_theta, random_initial_position
 import math
 
 
@@ -30,9 +30,10 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.robot: DB21J = DB21J("map_0/vehicle_0", simulated=True)
         self.initialize_sensors()
         self.action_space = spaces.Box(low=np.array([-1, -1]), high=np.array([1, 1]), dtype=np.float32)
-        self.observation_space = spaces.Box(
-            low=0, high=255, shape=(DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3), dtype=np.uint8
-        )
+        self.observation_space = spaces.Box(low=np.array([0, -np.pi]), high=np.array([0.5, np.pi]), dtype=np.float32)
+        #self.observation_space = spaces.Box(
+        #    low=0, high=255, shape=(DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3), dtype=np.uint8
+        #)
         self.map = {"frames": None, "tiles": None, "tile_info": None}
         self.get_map()
         self.map_int = MapInterpreter(map=self.map)
@@ -106,10 +107,11 @@ class DuckiematrixDB21JEnv(gym.Env):
             delta_t = float(pose["header"]["timestamp"]) - float(self.last_pose["header"]["timestamp"])
 
         x, y, yaw = pose["position"]["x"], pose["position"]["y"], compute_yaw(pose)
+        obs = np.array([compute_d(x, y), compute_theta(x, y, yaw)], dtype=np.float32)
 
-        d, theta = compute_d(x, y), compute_theta(x, y, yaw)
-        terminated = is_out_of_lane(x, y) or abs(theta) > math.pi / 2
-        reward = self.reward_fn(d, theta, actions, delta_t)
+        terminated = is_out_of_lane(x, y) or abs(obs[1]) > math.pi / 2
+        truncated = False
+        reward = self.reward_fn(obs[0], obs[1], actions, delta_t)
 
         self.last_pose = pose
 
@@ -120,42 +122,48 @@ class DuckiematrixDB21JEnv(gym.Env):
 
         self.info = {"pose": pose}
         info = self._get_info()
-        return (d, theta), reward, terminated, info
+        return obs, reward, terminated, truncated, info
         #return rgb, reward, terminated, d, theta, info
 
-    def reset(self, position: Tuple[float, float, float] | None = None):
+    def reset(self, position: Tuple[float, float, float] | None = None, curve_prob: float = 0.5):
         
-        if position is not None:
-            x, y, yaw = position
-            # construct a minimal pose dict similar to the one produced by
-            # the pose driver. We keep z/roll/pitch zero and use a simple
-            # quaternion for yaw-only rotation.
-            qw = np.cos(yaw / 2.0)
-            qz = np.sin(yaw / 2.0)
-            synthetic_pose = {
-                "header": {"timestamp": float(0)},
-                "position": {"x": float(x), "y": float(y), "z": 0.0},
-                "rotation": {"w": float(qw), "x": 0.0, "y": 0.0, "z": float(qz)},
-            }
-            # set last_pose so reward_fn and other internals start from here
-            self.last_pose = synthetic_pose
-            # send teleport command to the simulator (if supported)
-            header = Header(timestamp=float(0))
-            position_msg = Position(header=header, x=float(x), y=float(y), z=0.0)
-            rotation_msg = Quaternion(header=header, w=float(qw), x=0.0, y=0.0, z=float(qz))
-            target = getattr(self.robot, "_name", "") or ""
-            teleport = Transformation(
-                header=header,
-                source="",
-                target=target,
-                position=position_msg,
-                rotation=rotation_msg,
-            )
-            self.robot.pose_reset.set_pose(teleport)
-            # try to grab a fresh pose after requesting the reset
-            new_pose = self.robot.pose.capture(block=True, timeout=0.5)
-            if new_pose is not None:
-                self.last_pose = new_pose
+        # If no position provided, sample a random right-lane pose (curved with prob curve_prob).
+        if position is None:
+            position = random_initial_position(curve_prob)
+
+        x, y, yaw = position
+        # construct a minimal pose dict similar to the one produced by
+        # the pose driver. We keep z/roll/pitch zero and use a simple
+        # quaternion for yaw-only rotation.
+        qw = np.cos(yaw / 2.0)
+        qz = np.sin(yaw / 2.0)
+        synthetic_pose = {
+            "header": {"timestamp": float(0)},
+            "position": {"x": float(x), "y": float(y), "z": 0.0},
+            "rotation": {"w": float(qw), "x": 0.0, "y": 0.0, "z": float(qz)},
+        }
+        # set last_pose so reward_fn and other internals start from here
+        self.last_pose = synthetic_pose
+        # send teleport command to the simulator (if supported)
+        header = Header(timestamp=float(0))
+        position_msg = Position(header=header, x=float(x), y=float(y), z=0.0)
+        rotation_msg = Quaternion(header=header, w=float(qw), x=0.0, y=0.0, z=float(qz))
+        target = getattr(self.robot, "_name", "") or ""
+        teleport = Transformation(
+            header=header,
+            source="",
+            target=target,
+            position=position_msg,
+            rotation=rotation_msg,
+        )
+        self.robot.pose_reset.set_pose(teleport)
+        # try to grab a fresh pose after requesting the reset
+        new_pose = self.robot.pose.capture(block=True, timeout=0.5)
+        if new_pose is not None:
+            self.last_pose = new_pose
+
+        # Log the starting position to help users verify the reset
+        #print(f"Initial robot position: (x={round(x,2)}, y={round(y,2)}, yaw={round(yaw, 2)})")
 
         # perform the environment reset sequence used previously
         while True:
@@ -171,16 +179,15 @@ class DuckiematrixDB21JEnv(gym.Env):
             if self.last_pose is not None:
                 break
 
-        # Log the starting position to help users verify the reset
-        print(f"Initial robot position: (x={round(x,2)}, y={round(y,2)}, yaw={round(yaw, 2)})")
 
         # inform the engine to reset the robot state (engine may or may not
         # act on this depending on its capabilities)
         self.robot.reset_flag.set_reset(True)
         #obs = self.robot.camera.capture()
+        obs = np.array([compute_d(x, y), compute_theta(x, y, yaw)], dtype=np.float32)
         self.info = {"pose": self.last_pose}
         info = self._get_info()
-        return info
+        return obs, info
 
     def _get_reward(self) -> float:
         #TODO

@@ -22,37 +22,35 @@ start_y = lane_width/2
 start_yaw = 0.
 
 desired_reset = (start_x, start_y, start_yaw)
-info = env.reset(position=desired_reset)
+_, info = env.reset(position=desired_reset)
 sleep(0.1)
 i = 0
 for step in range(5000):
 
     action = [1, 1]
-    (d, theta), reward, terminated, info = env.step(action)
+    (d, theta), reward, terminated, truncated, info = env.step(action)
+
     sleep(0.1)
 
-    if info is not None:
-        print_step_info(step, action, reward, terminated, d, theta, info)
-    #p = env.robot.pose.capture() # for some reason this creates bugs, probably a delay issue
+    print_step_info(step, action, reward, terminated, d, theta, info)
     
-    if info is not None:
-        if terminated: # or is_out_of_bounds(info.get("pose")):
-            print("$$$$$$$$$$$$$$$$$$$$ ENVIRONMENT RESETTING $$$$$$$$$$$$$$$$$$$$")
-            info = env.reset(position=desired_reset)
-            sleep(0.1)
+    if terminated:
+        print("$$$$$$$$$$$$$$$$$$$$ ENVIRONMENT RESETTING $$$$$$$$$$$$$$$$$$$$")
+        _, info = env.reset()
+        sleep(0.1)
             
-            start_yaw = (i * math.pi / 8)
-            if i % 16 == 0:
-                i = 0
-                start_yaw = 0.
-                start_x += lane_width
-                if start_x > 3 * tile_size:
-                    start_x = lane_width / 2
-                    start_y += lane_width/2
-                    if start_y > 3 * tile_size:
-                        start_y = lane_width / 2
-            desired_reset = start_x, start_y, start_yaw
-            i += 1
+        start_yaw = (i * math.pi / 8)
+        if i % 16 == 0:
+            i = 0
+            start_yaw = 0.
+            start_x += lane_width
+            if start_x > 3 * tile_size:
+                start_x = lane_width / 2
+                start_y += lane_width/2
+                if start_y > 3 * tile_size:
+                    start_y = lane_width / 2
+        desired_reset = start_x, start_y, start_yaw
+        i += 1
 
 env.robot.camera.stop()
 env.robot.motors.stop()

@@ -24,10 +24,10 @@ def print_step_info(step, action, reward, terminated, d, theta, info):
     print()
     print(f"------------------------------ step {step} (before rollout) ------------------------------")
     print(f"action = {action}")
-    print(f"reward = {round(reward, 3) if reward is not None else None}")
+    print(f"reward = {reward:.2f}")
     print(f"terminated = {terminated}")
-    print(f"d = {round(d, 2)}")
-    print(f"theta = {round(theta, 2)}")
+    print(f"d = {d:.2f}")
+    print(f"theta = {theta:.2f}")
     if info is not None:
         print(f"info = ({round(info['pose']['position']['x'], 2)}, {round(info['pose']['position']['y'], 2)}, {round(compute_yaw(info['pose']), 2)})")
 
