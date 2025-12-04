@@ -25,6 +25,8 @@ desired_reset = (start_x, start_y, start_yaw)
 _, info = env.reset(position=desired_reset)
 sleep(0.1)
 i = 0
+last_pose = None
+
 for step in range(5000):
 
     action = [1, 1]
@@ -34,9 +36,28 @@ for step in range(5000):
 
     print_step_info(step, action, reward, terminated, d, theta, info)
     
+    # Track the last pose before termination
+    if not terminated:
+        last_pose = info.get("pose")
+    
     if terminated:
         print("$$$$$$$$$$$$$$$$$$$$ ENVIRONMENT RESETTING $$$$$$$$$$$$$$$$$$$$")
-        _, info = env.reset()
+        
+        # Get the position where termination occurred
+        terminated_pos = info.get("terminated_position")
+        if terminated_pos is None and last_pose is not None:
+            # Fallback: use last pose if terminated_position not available
+            terminated_pos = (last_pose["position"]["x"], last_pose["position"]["y"], 0.0)
+        
+        # Determine which tile to reset to
+        reset_tile = None
+        if terminated_pos is not None:
+            x, y, _ = terminated_pos
+            reset_tile = get_closest_tile(x, y)
+            print(f"[RESET] Robot went out of bounds at ({x:.3f}, {y:.3f}), resetting to tile {reset_tile}")
+        
+        # Reset to perfect position in that tile
+        _, info = env.reset(tile=reset_tile)
         sleep(0.1)
             
         start_yaw = (i * math.pi / 8)

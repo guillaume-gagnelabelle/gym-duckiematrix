@@ -7,7 +7,7 @@ from duckietown_messages.standard import Header
 from duckietown.sdk.robots.duckiebot import DB21J
 from duckietown.sdk.utils.lane_position import MapInterpreter, LanePositionCalculator
 from .utils import quaternion_to_euler, compute_yaw
-from duckietown.sdk.utils.loop_lane_position import is_out_of_lane, compute_d, compute_theta, random_initial_position
+from duckietown.sdk.utils.loop_lane_position import is_out_of_lane, compute_d, compute_theta, random_initial_position, perfect_initial_position, get_closest_tile
 import math
 
 
@@ -41,6 +41,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.out_of_road_penalty = out_of_road_penalty
         self.last_pose = None
         self.info : Dict = {}
+        self._last_terminated_position = None  # Store position where termination occurred
 
     def initialize_sensors(self):
         #self.robot.camera.start()
@@ -110,6 +111,13 @@ class DuckiematrixDB21JEnv(gym.Env):
         obs = np.array([compute_d(x, y), compute_theta(x, y, yaw)], dtype=np.float32)
 
         terminated = is_out_of_lane(x, y) or abs(obs[1]) > math.pi / 2
+        
+        # Store the position where termination occurred
+        if terminated:
+            self._last_terminated_position = (x, y, yaw)
+            # Also store in info for access from agent
+            self.info["terminated_position"] = (x, y, yaw)
+        
         truncated = False
         reward = self.reward_fn(obs[0], obs[1], actions, delta_t)
 
@@ -125,11 +133,26 @@ class DuckiematrixDB21JEnv(gym.Env):
         return obs, reward, terminated, truncated, info
         #return rgb, reward, terminated, d, theta, info
 
-    def reset(self, position: Tuple[float, float, float] | None = None, curve_prob: float = 0.5):
+    def reset(self, position: Tuple[float, float, float] | None = None, curve_prob: float = 0.5, perfect: bool = True, tile: int | None = None):
+        """
+        Reset the environment.
         
-        # If no position provided, sample a random right-lane pose (curved with prob curve_prob).
+        Args:
+            position: Specific (x, y, yaw) position to reset to. If None, uses perfect or random position.
+            curve_prob: Probability of choosing a curved tile (only used if position is None and tile is None).
+            perfect: If True and position is None, uses perfect_initial_position (exact center, perfect heading).
+                    If False, uses random_initial_position (with jitter).
+            tile: Specific tile number (0-8) to reset to. If provided, generates perfect position in that tile.
+        """
+        # If no position provided, use perfect position by default
         if position is None:
-            position = random_initial_position(curve_prob)
+            if tile is not None:
+                # Generate perfect position in the specified tile
+                position = perfect_initial_position(tile=tile, position_along_tile=0.5)
+            elif perfect:
+                position = perfect_initial_position(curve_prob=curve_prob)
+            else:
+                position = random_initial_position(curve_prob)
 
         x, y, yaw = position
         # construct a minimal pose dict similar to the one produced by
