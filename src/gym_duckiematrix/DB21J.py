@@ -2,13 +2,14 @@ from typing import Tuple, Dict
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+import time
+import math
 from duckietown_messages.geometry_3d import Transformation, Position, Quaternion
 from duckietown_messages.standard import Header
 from duckietown.sdk.robots.duckiebot import DB21J
 from duckietown.sdk.utils.lane_position import MapInterpreter, LanePositionCalculator
 from .utils import quaternion_to_euler, compute_yaw
 from duckietown.sdk.utils.loop_lane_position import is_out_of_lane, compute_d, compute_theta, random_initial_position, perfect_initial_position, get_closest_tile
-import math
 
 
 DEFAULT_CAMERA_WIDTH = 640
@@ -103,6 +104,29 @@ class DuckiematrixDB21JEnv(gym.Env):
         #    return None, None, None, None, None, None
         
         pose = self.robot.pose.capture()
+        
+        # Wait for pose if None (simulator might not have updated yet)
+        max_wait = 10
+        wait_count = 0
+        while pose is None and wait_count < max_wait:
+            time.sleep(0.01)
+            pose = self.robot.pose.capture()
+            wait_count += 1
+        
+        # If still None, use last pose or return default
+        if pose is None:
+            if self.last_pose is not None:
+                pose = self.last_pose
+            else:
+                # Return default observation if no pose available
+                obs = np.array([0.0, 0.0], dtype=np.float32)
+                reward = 0.0
+                terminated = False
+                truncated = False
+                self.info = {"pose": None}
+                info = self._get_info()
+                return obs, reward, terminated, truncated, info
+        
         delta_t = None
         if self.last_pose is not None and pose is not None:
             delta_t = float(pose["header"]["timestamp"]) - float(self.last_pose["header"]["timestamp"])
