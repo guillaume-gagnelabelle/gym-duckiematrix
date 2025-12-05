@@ -122,10 +122,27 @@ class REINFORCEAgent:
         
         # Normalize returns (reduces variance) - only if we have enough samples
         if len(returns) > 1:
+            returns_mean = returns.mean()
             returns_std = returns.std()
-            if returns_std > 1e-8:  # Only normalize if std is significant
-                returns = (returns - returns.mean()) / returns_std
-            # else: keep returns as-is (all same value)
+            if returns_std > 1e-4:  # Only normalize if std is significant
+                returns = (returns - returns_mean) / (returns_std + 1e-8)
+            else:
+                # If all returns are very similar, DON'T zero them out
+                # Instead, use raw returns (they still provide a learning signal)
+                # The mean subtraction would zero them, so we skip that
+                # Just ensure they're not all exactly zero
+                if torch.allclose(returns, returns[0], atol=1e-6):
+                    # All returns are essentially the same - use raw returns
+                    # This ensures we still have a gradient signal
+                    pass  # Keep returns as-is
+                else:
+                    # Small variance - center but don't divide
+                    returns = returns - returns_mean
+                    # Add small scale to ensure meaningful gradients
+                    returns = returns * 0.1  # Scale down but don't zero
+        else:
+            # Single return - can't normalize, but still use it
+            pass
         
         # Convert to tensors
         log_probs = torch.stack(self.episode_log_probs)
@@ -241,10 +258,12 @@ def train_reinforce(num_episodes=1000, max_steps_per_episode=1000, save_freq=100
         if (episode + 1) % 10 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
             avg_length = np.mean(episode_lengths[-10:])
+            # Debug: show if loss was skipped
+            loss_str = f"{loss:.4f}" if loss != 0.0 else "0.0000 (skipped)"
             print(f"Episode {episode + 1}/{num_episodes} | "
                   f"Avg Reward: {avg_reward:.2f} | "
                   f"Avg Length: {avg_length:.1f} | "
-                  f"Loss: {loss:.4f}")
+                  f"Loss: {loss_str}")
         
         # Save model periodically
         if (episode + 1) % save_freq == 0:
