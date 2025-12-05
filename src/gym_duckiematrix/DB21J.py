@@ -46,6 +46,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.last_position = None  # Track last (x, y) position for progress calculation
         self.last_yaw = None  # Track last yaw angle for turning rate calculation
         self.last_forward_velocity = 0.0  # Track last forward velocity for smooth motion
+        self._last_lateral_offset = None  # Track signed offset relative to lane centerline
         self.info : Dict = {}
         self._last_terminated_position = None  # Store position where termination occurred
 
@@ -90,84 +91,124 @@ class DuckiematrixDB21JEnv(gym.Env):
             x, y: Current position
             yaw: Current yaw angle
         """
-        # Large penalty for going out of bounds
-        if d > 0.585 / 2 or abs(theta) > math.pi / 2:
+        max_lane_offset = 0.585 / 2
+        if d > max_lane_offset or abs(theta) > math.pi / 2:
             return self.out_of_road_penalty
         
-        # If no valid time delta or no previous position, give zero reward (neutral)
         if delta_t is None or delta_t <= 0 or self.last_position is None:
             return 0.0
         
-        # Calculate displacement from last position
         dx = x - self.last_position[0]
         dy = y - self.last_position[1]
         displacement = math.sqrt(dx**2 + dy**2)
-        
-        # If not moving, give small negative reward (encourages movement)
         if displacement < 1e-6:
             return -0.1
         
-        # Compute forward progress: displacement projected onto desired direction
+        safe_delta_t = max(delta_t, 1e-4)
+        linear_speed = displacement / safe_delta_t
         forward_progress = displacement * math.cos(theta)
+        forward_velocity = forward_progress / safe_delta_t
         
-        # Compute forward velocity (m/s) - encourages smooth, flowing motion
-        forward_velocity = 0.0
-        if delta_t > 0:
-            forward_velocity = forward_progress / delta_t
+        # Encourage covering ground in the direction of travel.
+        forward_reward = 15.0 * forward_progress if forward_progress > 0 else 30.0 * forward_progress
         
-        # 1. REWARD: Forward progress (encourages advancing through lane)
-        if forward_progress > 0:
-            forward_reward = 15.0 * forward_progress  # Strong reward for forward distance
-        else:
-            forward_reward = 30.0 * forward_progress  # Heavy penalty for backward (double magnitude)
-        
-        # 2. REWARD: Forward velocity (encourages smooth, flowing movement)
-        # Reward maintaining good forward speed (0.1-0.5 m/s is good)
         velocity_reward = 0.0
-        if forward_velocity > 0.05:  # Only reward if moving forward
-            # Reward increases with velocity up to a point, then plateaus
-            velocity_reward = 3.0 * min(forward_velocity, 0.3)  # Max reward at 0.3 m/s
+        if forward_velocity > 0.05:
+            capped_velocity = min(forward_velocity, 0.35)
+            velocity_reward = 4.0 * (capped_velocity - 0.05)
+        else:
+            # Additional penalty for moving backwards in space
+            velocity_reward = -6.0 * abs(forward_velocity)
         
-        # 3. PENALTY: Turning too much (discourages excessive turning)
+        # Discourage negative wheel speeds directly (keeps policy from reversing)
+        reverse_penalty = 0.0
+        avg_pwm = 0.5 * float(action[0] + action[1])
+        if avg_pwm < 0:
+            reverse_penalty = 3.0 * abs(avg_pwm)
+        
+        curvature_reward, lateral_offset = self._curvature_alignment_bonus(x, y, yaw)
+        
+        # Centerline shaping: use lane-relative lateral offset (positive = toward yellow).
+        d_signed = compute_d_signed(x, y)
+        center_reward = 0.0
+        center_tolerance = 0.05
+        if lateral_offset is not None:
+            abs_d = abs(lateral_offset)
+            if abs_d <= center_tolerance:
+                center_reward = 2.0 * (1.0 - abs_d / center_tolerance)
+            elif lateral_offset > 0:
+                center_reward = -4.0 * (abs_d - center_tolerance)
+            else:
+                center_reward = -2.0 * (abs_d - center_tolerance)
+        
         turning_penalty = 0.0
         if self.last_yaw is not None and delta_t > 0:
-            # Compute angular velocity (rad/s)
-            yaw_diff = yaw - self.last_yaw
-            # Normalize to [-pi, pi]
-            yaw_diff = math.atan2(math.sin(yaw_diff), math.cos(yaw_diff))
+            yaw_diff = math.atan2(math.sin(yaw - self.last_yaw), math.cos(yaw - self.last_yaw))
             angular_velocity = abs(yaw_diff) / delta_t
-            
-            # Penalize high angular velocity (turning too fast)
-            # Angular velocity > 1.0 rad/s is considered excessive turning
             if angular_velocity > 0.5:
-                turning_penalty = 2.0 * (angular_velocity - 0.5)  # Penalty increases with turning rate
+                speed_scale = min(1.0, linear_speed / 0.4)
+                turning_penalty = 2.0 * (angular_velocity - 0.5) * speed_scale
         
-        # 4. PENALTY: Approaching yellow line (strongly discourages going toward yellow line)
-        d_signed = compute_d_signed(x, y)
-        yellow_line_penalty = 0.0
-        if d_signed > 0:  # On the right side (toward yellow line)
-            # Very strong penalty that increases quadratically as we approach yellow line
-            # At d_signed = 0.0 (center): penalty = 0
-            # At d_signed = 0.1 (close to yellow): penalty = 10.0
-            yellow_line_penalty = 10.0 * (d_signed ** 2)  # Quadratic penalty
+        heading_penalty = 0.4 * max(0.0, abs(theta) - 0.1)
         
-        # 5. PENALTY: Being off-center (encourages staying in lane center, but less on white line side)
-        if d_signed < 0:  # On the left side (toward white line) - safer
-            lane_penalty = 0.2 * abs(d)  # Small penalty
-        else:  # On the right side (toward yellow line) - dangerous
-            lane_penalty = 1.0 * abs(d)  # Larger penalty
+        directional_penalty = 0.0
+        recovery_bonus = 0.0
+        if lateral_offset is not None and lateral_offset > 0:
+            if theta > 0.02:
+                severity = min(1.0, theta / 0.3)
+                directional_penalty = 4.0 * lateral_offset * severity
+            elif theta < -0.02:
+                recovery = min(1.0, (-theta) / 0.3)
+                recovery_bonus = 2.0 * lateral_offset * recovery
         
-        # 6. PENALTY: Heading error (encourages alignment with lane direction)
-        # Only penalize significant misalignment to allow for small corrections
-        heading_penalty = 0.5 * max(0, abs(theta) - 0.1)  # Only penalize if > 0.1 rad (~5.7°)
+        self._last_lateral_offset = lateral_offset
         
-        # Total reward: rewards - penalties
-        reward = forward_reward + velocity_reward - turning_penalty - yellow_line_penalty - lane_penalty - heading_penalty
-        
-        # Update tracking variables
+        reward = (forward_reward + velocity_reward + center_reward + curvature_reward
+                  - turning_penalty - heading_penalty - reverse_penalty
+                  - directional_penalty + recovery_bonus)
         self.last_forward_velocity = forward_velocity
-        
         return reward
+
+    def _curvature_alignment_bonus(self, x: float, y: float, yaw: float, lookahead_distance: float = 0.25) -> tuple[float, float | None]:
+        """Reward alignment with the lane tangent ahead and return signed lateral offset (toward yellow positive)."""
+        if self.lp_cal is None:
+            return 0.0, None
+        
+        try:
+            pos_vec = np.array([x, 0.0, y], dtype=np.float32)
+            current_point, current_tangent = self.lp_cal.closest_curve_point(pos_vec, yaw)
+            if current_point is None or current_tangent is None:
+                return 0.0, None
+            
+            current_tangent = np.array(current_tangent, dtype=np.float32)
+            norm = np.linalg.norm(current_tangent)
+            if norm < 1e-6:
+                return 0.0, None
+            current_dir = current_tangent / norm
+            
+            ahead_seed = current_point + current_dir * lookahead_distance
+            ahead_point, ahead_tangent = self.lp_cal.closest_curve_point(ahead_seed, yaw)
+            target_tangent = ahead_tangent if ahead_tangent is not None else current_tangent
+            target_norm = np.linalg.norm(target_tangent)
+            if target_norm < 1e-6:
+                return 0.0, None
+            
+            target_dir = target_tangent / target_norm
+            desired_heading = math.atan2(-target_dir[2], target_dir[0])
+            heading_error = math.atan2(math.sin(desired_heading - yaw), math.cos(desired_heading - yaw))
+            
+            up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            inward_normal = np.cross(current_dir, up)
+            inward_norm = np.linalg.norm(inward_normal)
+            lateral_offset = None
+            if inward_norm > 1e-6:
+                inward_normal = inward_normal / inward_norm
+                offset_vec = pos_vec - current_point
+                lateral_offset = float(np.dot(offset_vec, inward_normal))
+            
+            return 1.5 * math.cos(heading_error), lateral_offset
+        except Exception:
+            return 0.0, None
 
     def step(self, actions : Tuple) -> Tuple:
         # TODO: this is a hack to simulate rad/s to PWM conversion
@@ -215,8 +256,8 @@ class DuckiematrixDB21JEnv(gym.Env):
         d = abs(d_signed) if d_signed >= 0 else compute_d(x, y)  # Fallback to abs if signed fails
         # Clamp d_signed to observation space bounds [-0.3, 0.3]
         # If out of lane (d_signed == -1), use a large value to indicate out of bounds
-        if d_signed < 0:  # Out of lane
-            d_signed_clamped = 0.3  # Use max value to indicate problem
+        if d_signed == -1:  # Out of lane sentinel
+            d_signed_clamped = 0.3
         else:
             d_signed_clamped = max(-0.3, min(0.3, d_signed))
         obs = np.array([d_signed_clamped, theta], dtype=np.float32)
@@ -288,6 +329,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.last_position = (x, y)  # Initialize last_position to reset position
         self.last_yaw = yaw  # Initialize last_yaw for turning rate calculation
         self.last_forward_velocity = 0.0  # Reset forward velocity tracking
+        self._last_lateral_offset = None
         # send teleport command to the simulator (if supported)
         header = Header(timestamp=float(0))
         position_msg = Position(header=header, x=float(x), y=float(y), z=0.0)
