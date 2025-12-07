@@ -17,13 +17,6 @@ DEFAULT_CAMERA_HEIGHT = 480
 
 class DuckiematrixDB21JEnv(gym.Env):
     def __init__(self, entity_name = "map_0/vehicle_0", out_of_road_penalty = -1.0):
-        #import matplotlib.pyplot as plt
-        # create matplot window
-        #self.window = plt.imshow(np.zeros((DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3)))
-        #plt.axis("off")
-        #self.fig = plt.figure(1)
-        #plt.subplots_adjust(left=0.0, right=1.0, top=1.0, bottom=0.0)
-        #plt.pause(0.01)
 
         self._shutdown = False
         #create connection to the matrix engine
@@ -33,9 +26,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         # Observation: [signed_distance_from_center, theta]
         # signed_distance: negative = left side (white line), positive = right side (yellow line)
         self.observation_space = spaces.Box(low=np.array([-0.3, -np.pi]), high=np.array([0.3, np.pi]), dtype=np.float32)
-        #self.observation_space = spaces.Box(
-        #    low=0, high=255, shape=(DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3), dtype=np.uint8
-        #)
+
         self.map = {"frames": None, "tiles": None, "tile_info": None}
         self.get_map()
         self.map_int = MapInterpreter(map=self.map)
