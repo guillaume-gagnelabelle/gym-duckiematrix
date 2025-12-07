@@ -9,15 +9,14 @@ from duckietown_messages.standard import Header
 from duckietown.sdk.robots.duckiebot import DB21J
 from duckietown.sdk.utils.lane_position import MapInterpreter, LanePositionCalculator
 from .utils import quaternion_to_euler, compute_yaw
-from duckietown.sdk.utils.loop_lane_position import is_out_of_lane, compute_d, compute_d_signed, compute_theta, random_initial_position, perfect_initial_position, get_closest_tile
-
+from duckietown.sdk.utils.loop_lane_position import *
 
 DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
 
 
 class DuckiematrixDB21JEnv(gym.Env):
-    def __init__(self, entity_name = "map_0/vehicle_0", out_of_road_penalty = -10.0):
+    def __init__(self, entity_name = "map_0/vehicle_0", out_of_road_penalty = -1.0):
         #import matplotlib.pyplot as plt
         # create matplot window
         #self.window = plt.imshow(np.zeros((DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3)))
@@ -78,7 +77,15 @@ class DuckiematrixDB21JEnv(gym.Env):
         return is_map               
         
         
-    def reward_fn(self, d, theta, action, delta_t, x, y, yaw):
+    def reward_fn(self, d, theta, action):
+
+        dist_from_center = abs(d)
+        
+        forward = np.sqrt(action[0] ** 2 + action[1] ** 2)
+        align = math.cos(theta)
+        
+        return 0.1 * (forward * align - dist_from_center)
+
         """
         Reward function that encourages smooth forward motion and discourages turning toward yellow line.
         
@@ -89,7 +96,7 @@ class DuckiematrixDB21JEnv(gym.Env):
             delta_t: Time delta
             x, y: Current position
             yaw: Current yaw angle
-        """
+        
         # Large penalty for going out of bounds
         if d > 0.585 / 2 or abs(theta) > math.pi / 2:
             return self.out_of_road_penalty
@@ -168,8 +175,54 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.last_forward_velocity = forward_velocity
         
         return reward
+        """
 
     def step(self, actions : Tuple) -> Tuple:
+        # TODO: this is a hack to simulate rad/s to PWM conversion
+        wl = actions[0]*0.4
+        wr = actions[1]*0.4
+
+        self.robot.motors.set_pwm(left=wl, right=wr)
+
+        pose = self.robot.pose.capture()
+        
+        # Wait for pose if None (simulator might not have updated yet)
+        max_wait = 10
+        wait_count = 0
+        truncated = False
+        while pose is None and wait_count < max_wait:
+            time.sleep(0.01)
+            pose = self.robot.pose.capture()
+            wait_count += 1
+        
+        # If still None, use last pose or return default
+        if pose is None:
+            if self.last_pose is not None:
+                pose = self.last_pose
+            else:
+                # Return default observation if no pose available
+                obs = np.array([0.0, 0.0], dtype=np.float32)
+                reward = 0.0   # TODO: CHANGE CODE SO THAT Q_TABLE DOESN'T GET UPDATED WHEN THIS HAPPENS. SHOULD USE TRUNCATED FOR THAT - DONE =)
+                terminated = False
+                truncated = True
+                self.info = {"pose": None}
+                info = self._get_info()
+                return obs, reward, terminated, truncated, info
+
+        x, y, yaw = pose["position"]["x"], pose["position"]["y"], compute_yaw(pose)
+        obs = np.array([compute_d_signed(x, y), compute_theta(x, y, yaw), np.int32(in_curve(x, y))], dtype=np.float32)
+
+        terminated = is_out_of_lane(x, y) or abs(obs[1]) > math.pi / 2
+
+        reward = self.reward_fn(obs[0], obs[1], actions) if not terminated else self.out_of_road_penalty
+
+        self.last_pose = pose
+
+        self.info = {"pose": pose}
+        info = self._get_info()
+        return obs, reward, terminated, truncated, info
+        
+        """
         # TODO: this is a hack to simulate rad/s to PWM conversion
         wl = actions[0]*0.4
         wr = actions[1]*0.4
@@ -250,7 +303,8 @@ class DuckiematrixDB21JEnv(gym.Env):
         info = self._get_info()
         return obs, reward, terminated, truncated, info
         #return rgb, reward, terminated, d, theta, info
-
+        """
+        
     def reset(self, position: Tuple[float, float, float] | None = None, curve_prob: float = 0.5, perfect: bool = True, tile: int | None = None):
         """
         Reset the environment.
@@ -264,13 +318,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         """
         # If no position provided, use perfect position by default
         if position is None:
-            if tile is not None:
-                # Generate perfect position in the specified tile
-                position = perfect_initial_position(tile=tile, position_along_tile=0.5)
-            elif perfect:
-                position = perfect_initial_position(curve_prob=curve_prob)
-            else:
-                position = random_initial_position(curve_prob)
+            position = random_initial_position(curve_prob)
 
         x, y, yaw = position
         # construct a minimal pose dict similar to the one produced by
@@ -330,7 +378,9 @@ class DuckiematrixDB21JEnv(gym.Env):
         # act on this depending on its capabilities)
         self.robot.reset_flag.set_reset(True)
         #obs = self.robot.camera.capture()
-        obs = np.array([compute_d(x, y), compute_theta(x, y, yaw)], dtype=np.float32)
+        #print("x = %.2f, y = %.2f" %(x, y))
+        obs = np.array([compute_d_signed(x, y), compute_theta(x, y, yaw), in_curve(x, y)], dtype=np.float32)
+        #print("d = %.2f" % obs[0])
         self.info = {"pose": self.last_pose}
         info = self._get_info()
         return obs, info
