@@ -37,12 +37,12 @@ class PolicyNetwork(nn.Module):
         nn.init.xavier_uniform_(self.fc_mean.weight)
         nn.init.xavier_uniform_(self.fc_std.weight)
         
-    def forward(self, obs):
+    def forward(self, obs, min_std=0.1):
         """Forward pass through the network."""
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
         mean = torch.tanh(self.fc_mean(x))  # Tanh to keep actions in [-1, 1]
-        std = F.softplus(self.fc_std(x)) + 0.01  # Softplus ensures std > 0, add small epsilon
+        std = F.softplus(self.fc_std(x)) + min_std  # Softplus ensures std > 0, add minimum for exploration
         return mean, std
 
 
@@ -72,7 +72,8 @@ class PPOAgent:
     """PPO agent implementation."""
     
     def __init__(self, obs_dim=2, action_dim=2, lr=3e-4, gamma=0.99, 
-                 eps_clip=0.2, k_epochs=4, use_value=True, device='cpu'):
+                 eps_clip=0.2, k_epochs=4, use_value=True, device='cpu',
+                 exploration_noise=0.1, epsilon_start=0.3, epsilon_end=0.05, epsilon_decay=0.995):
         """
         Args:
             obs_dim: Observation dimension
@@ -100,6 +101,13 @@ class PPOAgent:
             self.value_optimizer = optim.Adam(self.value.parameters(), lr=lr)
         else:
             self.value = None
+        
+        # Exploration parameters
+        self.exploration_noise = exploration_noise
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.min_std = 0.15  # Minimum std for exploration (prevents premature convergence)
         
         # Batch storage
         self.reset_batch()
@@ -137,8 +145,8 @@ class PPOAgent:
         self.batch_dones = []
         self.batch_values = []  # Only used if use_value=True
         
-    def select_action(self, obs):
-        """Select an action using the current policy."""
+    def select_action(self, obs, apply_exploration=True):
+        """Select an action using the current policy with exploration."""
         # Check for NaN in observation
         if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
             print(f"Warning: Invalid observation detected: {obs}, using zeros")
@@ -146,23 +154,38 @@ class PPOAgent:
         
         obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
         
-        # Get action distribution
-        mean, std = self.policy(obs_tensor)
-        
-        # Check for NaN in network output
-        if torch.any(torch.isnan(mean)) or torch.any(torch.isnan(std)):
-            print(f"Warning: NaN detected in policy output, using default actions")
-            mean = torch.zeros_like(mean)
-            std = torch.ones_like(std) * 0.1
-        
-        # Ensure std is positive and reasonable
-        std = torch.clamp(std, min=0.01, max=1.0)
-        
-        dist = torch.distributions.Normal(mean, std)
-        
-        # Sample action
-        action = dist.sample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
+        # Epsilon-greedy exploration: random action with probability epsilon
+        if apply_exploration and np.random.random() < self.epsilon:
+            # Random action, but bias toward forward motion
+            action = np.random.uniform(-1.0, 1.0, size=2)
+            if np.random.random() < 0.7:  # 70% chance of forward-biased action
+                action = np.clip(action + 0.3, -1.0, 1.0)
+            action = torch.FloatTensor(action).unsqueeze(0)
+            # Create a dummy log_prob for storage (will be recomputed during update)
+            log_prob = torch.tensor(0.0)
+        else:
+            # Get action distribution
+            mean, std = self.policy(obs_tensor, min_std=self.min_std)
+            
+            # Check for NaN in network output
+            if torch.any(torch.isnan(mean)) or torch.any(torch.isnan(std)):
+                print(f"Warning: NaN detected in policy output, using default actions")
+                mean = torch.zeros_like(mean)
+                std = torch.ones_like(std) * 0.1
+            
+            # Ensure std is positive and reasonable (with minimum for exploration)
+            std = torch.clamp(std, min=self.min_std, max=1.0)
+            
+            dist = torch.distributions.Normal(mean, std)
+            
+            # Sample action
+            action = dist.sample()
+            log_prob = dist.log_prob(action).sum(dim=-1)
+            
+            # Add exploration noise
+            if apply_exploration:
+                noise = torch.randn_like(action) * self.exploration_noise
+                action = action + noise
         
         # Clip action to valid range
         action = torch.clamp(action, -1.0, 1.0)
@@ -181,6 +204,10 @@ class PPOAgent:
             self.batch_values.append(value.cpu().item())
         
         return action.cpu().numpy().flatten()
+    
+    def decay_epsilon(self):
+        """Decay epsilon for epsilon-greedy exploration."""
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
     
     def store_transition(self, reward, done):
         """Store reward and done flag for the current step."""
@@ -260,8 +287,8 @@ class PPOAgent:
         # Multiple epochs of updates on the same batch
         for epoch in range(self.k_epochs):
             # Get current policy distribution
-            mean, std = self.policy(obs_tensor)
-            std = torch.clamp(std, min=0.01, max=1.0)
+            mean, std = self.policy(obs_tensor, min_std=self.min_std)
+            std = torch.clamp(std, min=self.min_std, max=1.0)
             dist = torch.distributions.Normal(mean, std)
             
             # Compute new log probabilities
@@ -371,8 +398,11 @@ def train_ppo(num_episodes=1000, max_steps_per_episode=1000,
         last_pose = None
         
         for step in range(max_steps_per_episode):
-            # Select action
-            action = agent.select_action(obs)
+            # Select action with exploration
+            action = agent.select_action(obs, apply_exploration=True)
+            # Decay epsilon periodically
+            if total_steps % 100 == 0:
+                agent.decay_epsilon()
             
             # Take step
             next_obs, reward, terminated, truncated, info = env.step(action)
