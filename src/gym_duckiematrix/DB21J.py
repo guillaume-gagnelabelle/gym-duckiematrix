@@ -22,10 +22,10 @@ class DuckiematrixDB21JEnv(gym.Env):
         #create connection to the matrix engine
         self.robot: DB21J = DB21J("map_0/vehicle_0", simulated=True)
         self.initialize_sensors()
-        self.action_space = spaces.Box(low=np.array([-1, -1]), high=np.array([1, 1]), dtype=np.float32)
+        #self.action_space = spaces.Box(low=np.array([-1, -1]), high=np.array([1, 1]), dtype=np.float32)
         # Observation: [signed_distance_from_center, theta]
         # signed_distance: negative = left side (white line), positive = right side (yellow line)
-        self.observation_space = spaces.Box(low=np.array([-0.3, -np.pi]), high=np.array([0.3, np.pi]), dtype=np.float32)
+        #self.observation_space = spaces.Box(low=np.array([-0.3, -np.pi]), high=np.array([0.3, np.pi]), dtype=np.float32)
 
         self.map = {"frames": None, "tiles": None, "tile_info": None}
         self.get_map()
@@ -38,6 +38,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.last_forward_velocity = 0.0  # Track last forward velocity for smooth motion
         self.info : Dict = {}
         self._last_terminated_position = None  # Store position where termination occurred
+        self.distance = 0.0
 
     def initialize_sensors(self):
         #self.robot.camera.start()
@@ -77,96 +78,6 @@ class DuckiematrixDB21JEnv(gym.Env):
         
         return 0.1 * (forward * align - dist_from_center)
 
-        """
-        Reward function that encourages smooth forward motion and discourages turning toward yellow line.
-        
-        Args:
-            d: Distance from lane center (absolute)
-            theta: Angle between desired heading and actual heading
-            action: Action taken
-            delta_t: Time delta
-            x, y: Current position
-            yaw: Current yaw angle
-        
-        # Large penalty for going out of bounds
-        if d > 0.585 / 2 or abs(theta) > math.pi / 2:
-            return self.out_of_road_penalty
-        
-        # If no valid time delta or no previous position, give zero reward (neutral)
-        if delta_t is None or delta_t <= 0 or self.last_position is None:
-            return 0.0
-        
-        # Calculate displacement from last position
-        dx = x - self.last_position[0]
-        dy = y - self.last_position[1]
-        displacement = math.sqrt(dx**2 + dy**2)
-        
-        # If not moving, give small negative reward (encourages movement)
-        if displacement < 1e-6:
-            return -0.1
-        
-        # Compute forward progress: displacement projected onto desired direction
-        forward_progress = displacement * math.cos(theta)
-        
-        # Compute forward velocity (m/s) - encourages smooth, flowing motion
-        forward_velocity = 0.0
-        if delta_t > 0:
-            forward_velocity = forward_progress / delta_t
-        
-        # 1. REWARD: Forward progress (encourages advancing through lane)
-        if forward_progress > 0:
-            forward_reward = 15.0 * forward_progress  # Strong reward for forward distance
-        else:
-            forward_reward = 30.0 * forward_progress  # Heavy penalty for backward (double magnitude)
-        
-        # 2. REWARD: Forward velocity (encourages smooth, flowing movement)
-        # Reward maintaining good forward speed (0.1-0.5 m/s is good)
-        velocity_reward = 0.0
-        if forward_velocity > 0.05:  # Only reward if moving forward
-            # Reward increases with velocity up to a point, then plateaus
-            velocity_reward = 3.0 * min(forward_velocity, 0.3)  # Max reward at 0.3 m/s
-        
-        # 3. PENALTY: Turning too much (discourages excessive turning)
-        turning_penalty = 0.0
-        if self.last_yaw is not None and delta_t > 0:
-            # Compute angular velocity (rad/s)
-            yaw_diff = yaw - self.last_yaw
-            # Normalize to [-pi, pi]
-            yaw_diff = math.atan2(math.sin(yaw_diff), math.cos(yaw_diff))
-            angular_velocity = abs(yaw_diff) / delta_t
-            
-            # Penalize high angular velocity (turning too fast)
-            # Angular velocity > 1.0 rad/s is considered excessive turning
-            if angular_velocity > 0.5:
-                turning_penalty = 2.0 * (angular_velocity - 0.5)  # Penalty increases with turning rate
-        
-        # 4. PENALTY: Approaching yellow line (strongly discourages going toward yellow line)
-        d_signed = compute_d_signed(x, y)
-        yellow_line_penalty = 0.0
-        if d_signed > 0:  # On the right side (toward yellow line)
-            # Very strong penalty that increases quadratically as we approach yellow line
-            # At d_signed = 0.0 (center): penalty = 0
-            # At d_signed = 0.1 (close to yellow): penalty = 10.0
-            yellow_line_penalty = 10.0 * (d_signed ** 2)  # Quadratic penalty
-        
-        # 5. PENALTY: Being off-center (encourages staying in lane center, but less on white line side)
-        if d_signed < 0:  # On the left side (toward white line) - safer
-            lane_penalty = 0.2 * abs(d)  # Small penalty
-        else:  # On the right side (toward yellow line) - dangerous
-            lane_penalty = 1.0 * abs(d)  # Larger penalty
-        
-        # 6. PENALTY: Heading error (encourages alignment with lane direction)
-        # Only penalize significant misalignment to allow for small corrections
-        heading_penalty = 0.5 * max(0, abs(theta) - 0.1)  # Only penalize if > 0.1 rad (~5.7°)
-        
-        # Total reward: rewards - penalties
-        reward = forward_reward + velocity_reward - turning_penalty - yellow_line_penalty - lane_penalty - heading_penalty
-        
-        # Update tracking variables
-        self.last_forward_velocity = forward_velocity
-        
-        return reward
-        """
 
     def step(self, actions : Tuple) -> Tuple:
         # TODO: this is a hack to simulate rad/s to PWM conversion
@@ -196,106 +107,30 @@ class DuckiematrixDB21JEnv(gym.Env):
                 reward = 0.0   # TODO: CHANGE CODE SO THAT Q_TABLE DOESN'T GET UPDATED WHEN THIS HAPPENS. SHOULD USE TRUNCATED FOR THAT - DONE =)
                 terminated = False
                 truncated = True
+                self.distance = 0
                 self.info = {"pose": None}
+                self.info["distance"]= self.distance
                 info = self._get_info()
                 return obs, reward, terminated, truncated, info
 
         x, y, yaw = pose["position"]["x"], pose["position"]["y"], compute_yaw(pose)
+        last_x, last_y = self.last_pose["position"]["x"], self.last_pose["position"]["y"]
         obs = np.array([compute_d_signed(x, y), compute_theta(x, y, yaw), np.int32(in_curve(x, y))], dtype=np.float32)
 
         terminated = is_out_of_lane(x, y) or abs(obs[1]) > math.pi / 2
 
         reward = self.reward_fn(obs[0], obs[1], actions) if not terminated else self.out_of_road_penalty
 
+        self.distance = ((x - last_x) ** 2 + (y - last_y) ** 2) ** 0.5
         self.last_pose = pose
 
         self.info = {"pose": pose}
+        self.info["distance"] = self.distance
+
         info = self._get_info()
         return obs, reward, terminated, truncated, info
         
-        """
-        # TODO: this is a hack to simulate rad/s to PWM conversion
-        wl = actions[0]*0.4
-        wr = actions[1]*0.4
 
-        self.robot.motors.set_pwm(left=wl, right=wr)
-        #bgr = self.robot.camera.capture()
-        
-        #if bgr is None:
-        #    print("got no image.. skipping")
-        #    return None, None, None, None, None, None
-        
-        pose = self.robot.pose.capture()
-        
-        # Wait for pose if None (simulator might not have updated yet)
-        max_wait = 10
-        wait_count = 0
-        while pose is None and wait_count < max_wait:
-            time.sleep(0.01)
-            pose = self.robot.pose.capture()
-            wait_count += 1
-        
-        # If still None, use last pose or return default
-        if pose is None:
-            if self.last_pose is not None:
-                pose = self.last_pose
-            else:
-                # Return default observation if no pose available
-                obs = np.array([0.0, 0.0], dtype=np.float32)
-                reward = 0.0
-                terminated = False
-                truncated = False
-                self.info = {"pose": None}
-                info = self._get_info()
-                return obs, reward, terminated, truncated, info
-        
-        delta_t = None
-        if self.last_pose is not None and pose is not None:
-            delta_t = float(pose["header"]["timestamp"]) - float(self.last_pose["header"]["timestamp"])
-
-        x, y, yaw = pose["position"]["x"], pose["position"]["y"], compute_yaw(pose)
-        d_signed = compute_d_signed(x, y)
-        theta = compute_theta(x, y, yaw)
-        d = abs(d_signed) if d_signed >= 0 else compute_d(x, y)  # Fallback to abs if signed fails
-        # Clamp d_signed to observation space bounds [-0.3, 0.3]
-        # If out of lane (d_signed == -1), use a large value to indicate out of bounds
-        if d_signed < 0:  # Out of lane
-            d_signed_clamped = 0.3  # Use max value to indicate problem
-        else:
-            d_signed_clamped = max(-0.3, min(0.3, d_signed))
-        obs = np.array([d_signed_clamped, theta], dtype=np.float32)
-
-        # Only terminate if actually out of lane bounds
-        # Don't terminate on theta alone - the reward function already penalizes high theta
-        # This allows the agent to make corrections and recover from mistakes
-        terminated = is_out_of_lane(x, y)
-        
-        # Store the position where termination occurred
-        if terminated:
-            self._last_terminated_position = (x, y, yaw)
-            # Also store in info for access from agent
-            self.info["terminated_position"] = (x, y, yaw)
-        
-        truncated = False
-        # Pass absolute distance d to reward function (for termination check)
-        reward = self.reward_fn(d, theta, actions, delta_t, x, y, yaw)
-
-        # Update last position and yaw for next step's calculations
-        self.last_position = (x, y)
-        self.last_yaw = yaw
-        self.last_pose = pose
-
-        #rgb = bgr[:, :, [2,1,0]]
-        #self.window.set_data(rgb)
-        #self.fig.canvas.draw_idle()
-        #self.fig.canvas.start_event_loop(0.00001)
-
-        self.info = {"pose": pose}
-        info = self._get_info()
-        return obs, reward, terminated, truncated, info
-        #return rgb, reward, terminated, d, theta, info
-        """
-        
     def reset(self, position: Tuple[float, float, float] | None = None, curve_prob: float = 0.5, perfect: bool = True, tile: int | None = None):
         """
         Reset the environment.
@@ -327,7 +162,10 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.last_position = (x, y)  # Initialize last_position to reset position
         self.last_yaw = yaw  # Initialize last_yaw for turning rate calculation
         self.last_forward_velocity = 0.0  # Reset forward velocity tracking
+        self.distance = 0.0
         # send teleport command to the simulator (if supported)
+        # clear any stale pose so we can wait for a fresh post-reset reading
+        self.robot.pose.capture()
         header = Header(timestamp=float(0))
         position_msg = Position(header=header, x=float(x), y=float(y), z=0.0)
         rotation_msg = Quaternion(header=header, w=float(qw), x=0.0, y=0.0, z=float(qz))
@@ -339,9 +177,27 @@ class DuckiematrixDB21JEnv(gym.Env):
             position=position_msg,
             rotation=rotation_msg,
         )
+        
+        self.robot.motors.set_pwm(left=0, right=0)
         self.robot.pose_reset.set_pose(teleport)
-        # try to grab a fresh pose after requesting the reset
-        new_pose = self.robot.pose.capture(block=True, timeout=0.5)
+        # try to grab a fresh pose after requesting the reset; prefer one close to target
+        t_start = time.time()
+        new_pose = None
+        while time.time() - t_start < 0.5:
+            candidate = self.robot.pose.capture(block=True, timeout=0.1)
+            if candidate is None:
+                continue
+            cx, cy = candidate["position"]["x"], candidate["position"]["y"]
+            cyaw = compute_yaw(candidate)
+            close_pos = abs(cx - x) < 0.05 and abs(cy - y) < 0.05
+            yaw_diff = (cyaw - yaw + math.pi) % (2 * math.pi) - math.pi
+            close_yaw = abs(yaw_diff) < 0.05
+            if close_pos and close_yaw:
+                new_pose = candidate
+                break
+        # fall back to any captured pose if no close match found
+        if new_pose is None:
+            new_pose = candidate if "candidate" in locals() else None
         if new_pose is not None:
             self.last_pose = new_pose
             # Update last_position with actual reset position
@@ -368,17 +224,12 @@ class DuckiematrixDB21JEnv(gym.Env):
         # inform the engine to reset the robot state (engine may or may not
         # act on this depending on its capabilities)
         self.robot.reset_flag.set_reset(True)
-        #obs = self.robot.camera.capture()
-        #print("x = %.2f, y = %.2f" %(x, y))
         obs = np.array([compute_d_signed(x, y), compute_theta(x, y, yaw), in_curve(x, y)], dtype=np.float32)
-        #print("d = %.2f" % obs[0])
         self.info = {"pose": self.last_pose}
+        self.info["distance"] = self.distance
         info = self._get_info()
         return obs, info
 
-    def _get_reward(self) -> float:
-        #TODO
-        return 0.0
 
     def _get_info(self) -> Dict:
         """Get the info for each robot in the environment
