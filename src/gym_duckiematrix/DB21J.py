@@ -9,15 +9,24 @@ from duckietown_messages.standard import Header
 from duckietown.sdk.robots.duckiebot import DB21J
 from duckietown.sdk.utils.lane_position import MapInterpreter, LanePositionCalculator
 from .utils import quaternion_to_euler, compute_yaw
-from duckietown.sdk.utils.loop_lane_position import is_out_of_lane, compute_d, compute_d_signed, compute_theta, random_initial_position, perfect_initial_position, get_closest_tile
+from duckietown.sdk.utils.loop_lane_position import (
+    is_out_of_lane,
+    compute_d,
+    compute_d_signed,
+    compute_theta,
+    random_initial_position,
+    perfect_initial_position,
+    get_closest_tile,
+)
 
 
 DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
+CURVED_TILES = {0, 2, 6, 8}
 
 
 class DuckiematrixDB21JEnv(gym.Env):
-    def __init__(self, entity_name = "map_0/vehicle_0", out_of_road_penalty = -10.0):
+    def __init__(self, entity_name = "map_0/vehicle_0", out_of_road_penalty = -10.0, include_curve_flag: bool = False):
         #import matplotlib.pyplot as plt
         # create matplot window
         #self.window = plt.imshow(np.zeros((DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3)))
@@ -27,13 +36,26 @@ class DuckiematrixDB21JEnv(gym.Env):
         #plt.pause(0.01)
 
         self._shutdown = False
+        self.include_curve_flag = include_curve_flag
+        self.pose_reset_available = True
         #create connection to the matrix engine
         self.robot: DB21J = DB21J("map_0/vehicle_0", simulated=True)
         self.initialize_sensors()
-        self.action_space = spaces.Box(low=np.array([-1, -1]), high=np.array([1, 1]), dtype=np.float32)
-        # Observation: [signed_distance_from_center, theta]
+        self.action_space = spaces.Box(low=np.array([0.0, 0.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
+        # Observation: [signed_distance_from_center, theta] (+ optional curve flag)
         # signed_distance: negative = left side (white line), positive = right side (yellow line)
-        self.observation_space = spaces.Box(low=np.array([-0.3, -np.pi]), high=np.array([0.3, np.pi]), dtype=np.float32)
+        if include_curve_flag:
+            self.observation_space = spaces.Box(
+                low=np.array([-0.3, -np.pi, 0.0], dtype=np.float32),
+                high=np.array([0.3, np.pi, 1.0], dtype=np.float32),
+                dtype=np.float32,
+            )
+        else:
+            self.observation_space = spaces.Box(
+                low=np.array([-0.3, -np.pi], dtype=np.float32),
+                high=np.array([0.3, np.pi], dtype=np.float32),
+                dtype=np.float32,
+            )
         #self.observation_space = spaces.Box(
         #    low=0, high=255, shape=(DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, 3), dtype=np.uint8
         #)
@@ -58,7 +80,11 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.robot.map_tile_info.start()
         self.robot.pose.start()
         self.robot.reset_flag.start()
-        self.robot.pose_reset.start()
+        try:
+            self.robot.pose_reset.start()
+        except Exception as exc:  # pose_reset endpoint may be missing in some setups
+            print(f"[WARN] pose_reset not available: {exc}")
+            self.pose_reset_available = False
         
     def get_map(self):
         while True:
@@ -81,92 +107,31 @@ class DuckiematrixDB21JEnv(gym.Env):
         
     def reward_fn(self, d, theta, action, delta_t, x, y, yaw):
         """
-        Reward function that encourages smooth forward motion and discourages turning toward yellow line.
-        
-        Args:
-            d: Distance from lane center (absolute)
-            theta: Angle between desired heading and actual heading
-            action: Action taken
-            delta_t: Time delta
-            x, y: Current position
-            yaw: Current yaw angle
+        Simplified reward:
+        -1.0 if the bot leaves the lane or heading diverges too much.
+        Otherwise 0.1 * (speed_aligned_with_lane - distance_from_center).
         """
+        # Terminate-style penalty if clearly out of bounds or wildly off-heading.
         max_lane_offset = 0.585 / 2
-        if d > max_lane_offset or abs(theta) > math.pi / 2:
-            return self.out_of_road_penalty
-        
+        if d < 0 or d > max_lane_offset or abs(theta) > math.pi / 2:
+            return -1.0
+
         if delta_t is None or delta_t <= 0 or self.last_position is None:
             return 0.0
-        
+
         dx = x - self.last_position[0]
         dy = y - self.last_position[1]
         displacement = math.sqrt(dx**2 + dy**2)
-        if displacement < 1e-6:
-            return -0.1
-        
+
         safe_delta_t = max(delta_t, 1e-4)
         linear_speed = displacement / safe_delta_t
-        forward_progress = displacement * math.cos(theta)
-        forward_velocity = forward_progress / safe_delta_t
-        
-        # Encourage covering ground in the direction of travel.
-        forward_reward = 15.0 * forward_progress if forward_progress > 0 else 30.0 * forward_progress
-        
-        velocity_reward = 0.0
-        if forward_velocity > 0.05:
-            capped_velocity = min(forward_velocity, 0.35)
-            velocity_reward = 4.0 * (capped_velocity - 0.05)
-        else:
-            # Additional penalty for moving backwards in space
-            velocity_reward = -6.0 * abs(forward_velocity)
-        
-        # Discourage negative wheel speeds directly (keeps policy from reversing)
-        reverse_penalty = 0.0
-        avg_pwm = 0.5 * float(action[0] + action[1])
-        if avg_pwm < 0:
-            reverse_penalty = 3.0 * abs(avg_pwm)
-        
-        curvature_reward, lateral_offset = self._curvature_alignment_bonus(x, y, yaw)
-        
-        # Centerline shaping: use lane-relative lateral offset (positive = toward yellow).
-        d_signed = compute_d_signed(x, y)
-        center_reward = 0.0
-        center_tolerance = 0.05
-        if lateral_offset is not None:
-            abs_d = abs(lateral_offset)
-            if abs_d <= center_tolerance:
-                center_reward = 2.0 * (1.0 - abs_d / center_tolerance)
-            elif lateral_offset > 0:
-                center_reward = -4.0 * (abs_d - center_tolerance)
-            else:
-                center_reward = -2.0 * (abs_d - center_tolerance)
-        
-        turning_penalty = 0.0
-        if self.last_yaw is not None and delta_t > 0:
-            yaw_diff = math.atan2(math.sin(yaw - self.last_yaw), math.cos(yaw - self.last_yaw))
-            angular_velocity = abs(yaw_diff) / delta_t
-            if angular_velocity > 0.5:
-                speed_scale = min(1.0, linear_speed / 0.4)
-                turning_penalty = 2.0 * (angular_velocity - 0.5) * speed_scale
-        
-        heading_penalty = 0.4 * max(0.0, abs(theta) - 0.1)
-        
-        directional_penalty = 0.0
-        recovery_bonus = 0.0
-        if lateral_offset is not None and lateral_offset > 0:
-            if theta > 0.02:
-                severity = min(1.0, theta / 0.3)
-                directional_penalty = 4.0 * lateral_offset * severity
-            elif theta < -0.02:
-                recovery = min(1.0, (-theta) / 0.3)
-                recovery_bonus = 2.0 * lateral_offset * recovery
-        
-        self._last_lateral_offset = lateral_offset
-        
-        reward = (forward_reward + velocity_reward + center_reward + curvature_reward
-                  - turning_penalty - heading_penalty - reverse_penalty
-                  - directional_penalty + recovery_bonus)
-        self.last_forward_velocity = forward_velocity
+
+        alignment = math.cos(theta)  # 1 when aligned, 0 when perpendicular
+        aligned_speed = linear_speed * alignment
+
+        # Forward-focused shaping; backward motion already limited by action clipping
+        reward = 0.1 * (aligned_speed - d)
+        self.last_forward_velocity = aligned_speed
         return reward
 
     def _curvature_alignment_bonus(self, x: float, y: float, yaw: float, lookahead_distance: float = 0.25) -> tuple[float, float | None]:
@@ -212,8 +177,9 @@ class DuckiematrixDB21JEnv(gym.Env):
 
     def step(self, actions : Tuple) -> Tuple:
         # TODO: this is a hack to simulate rad/s to PWM conversion
-        wl = actions[0]*0.4
-        wr = actions[1]*0.4
+        safe_actions = np.clip(actions, 0.0, 1.0)
+        wl = safe_actions[0]*0.4
+        wr = safe_actions[1]*0.4
 
         self.robot.motors.set_pwm(left=wl, right=wr)
         #bgr = self.robot.camera.capture()
@@ -238,11 +204,14 @@ class DuckiematrixDB21JEnv(gym.Env):
                 pose = self.last_pose
             else:
                 # Return default observation if no pose available
-                obs = np.array([0.0, 0.0], dtype=np.float32)
+                obs_vals = [0.0, 0.0]
+                if self.include_curve_flag:
+                    obs_vals.append(0.0)
+                obs = np.array(obs_vals, dtype=np.float32)
                 reward = 0.0
                 terminated = False
                 truncated = False
-                self.info = {"pose": None}
+                self.info = {"pose": None, "tile": None, "is_curve_tile": None}
                 info = self._get_info()
                 return obs, reward, terminated, truncated, info
         
@@ -260,7 +229,14 @@ class DuckiematrixDB21JEnv(gym.Env):
             d_signed_clamped = 0.3
         else:
             d_signed_clamped = max(-0.3, min(0.3, d_signed))
-        obs = np.array([d_signed_clamped, theta], dtype=np.float32)
+
+        tile_id = get_closest_tile(x, y)
+        is_curve_tile = 1.0 if tile_id in CURVED_TILES else 0.0
+
+        obs_vals = [d_signed_clamped, theta]
+        if self.include_curve_flag:
+            obs_vals.append(is_curve_tile)
+        obs = np.array(obs_vals, dtype=np.float32)
 
         # Only terminate if actually out of lane bounds
         # Don't terminate on theta alone - the reward function already penalizes high theta
@@ -287,7 +263,7 @@ class DuckiematrixDB21JEnv(gym.Env):
         #self.fig.canvas.draw_idle()
         #self.fig.canvas.start_event_loop(0.00001)
 
-        self.info = {"pose": pose}
+        self.info = {"pose": pose, "tile": tile_id, "is_curve_tile": bool(is_curve_tile)}
         info = self._get_info()
         return obs, reward, terminated, truncated, info
         #return rgb, reward, terminated, d, theta, info
@@ -342,7 +318,12 @@ class DuckiematrixDB21JEnv(gym.Env):
             position=position_msg,
             rotation=rotation_msg,
         )
-        self.robot.pose_reset.set_pose(teleport)
+        if self.pose_reset_available:
+            try:
+                self.robot.pose_reset.set_pose(teleport)
+            except Exception as exc:
+                print(f"[WARN] pose_reset.set_pose failed (continuing without teleport): {exc}")
+                self.pose_reset_available = False
         # try to grab a fresh pose after requesting the reset
         new_pose = self.robot.pose.capture(block=True, timeout=0.5)
         if new_pose is not None:
@@ -372,8 +353,14 @@ class DuckiematrixDB21JEnv(gym.Env):
         # act on this depending on its capabilities)
         self.robot.reset_flag.set_reset(True)
         #obs = self.robot.camera.capture()
-        obs = np.array([compute_d(x, y), compute_theta(x, y, yaw)], dtype=np.float32)
-        self.info = {"pose": self.last_pose}
+        obs_x, obs_y = self.last_position if self.last_position is not None else (x, y)
+        obs_yaw = self.last_yaw if self.last_yaw is not None else yaw
+        tile_id = get_closest_tile(obs_x, obs_y)
+        obs_vals = [compute_d(obs_x, obs_y), compute_theta(obs_x, obs_y, obs_yaw)]
+        if self.include_curve_flag:
+            obs_vals.append(1.0 if tile_id in CURVED_TILES else 0.0)
+        obs = np.array(obs_vals, dtype=np.float32)
+        self.info = {"pose": self.last_pose, "tile": tile_id, "is_curve_tile": tile_id in CURVED_TILES}
         info = self._get_info()
         return obs, info
 

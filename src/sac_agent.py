@@ -85,7 +85,6 @@ class PolicyNetwork(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc_mean = nn.Linear(hidden_dim, action_dim)
         self.fc_log_std = nn.Linear(hidden_dim, action_dim)
-        
         # Initialize weights
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
@@ -110,21 +109,25 @@ class PolicyNetwork(nn.Module):
         normal = torch.distributions.Normal(mean, std)
         x_t = normal.rsample()  # Reparameterization trick
         
-        # Squash to [-1, 1] using tanh
+        # Squash to [-1, 1] using tanh, then map to [0, 1] to prevent backward motion
         action = torch.tanh(x_t)
+        action = 0.5 * (action + 1.0)
         
         # Compute log probability (with tanh correction)
         log_prob = normal.log_prob(x_t)
         # Tanh correction: log(1 - tanh^2(x))
-        log_prob -= torch.log(1 - action.pow(2) + epsilon)
+        tanh_action = 2.0 * action - 1.0  # recover tanh(action) for correction
+        log_prob -= torch.log(1 - tanh_action.pow(2) + epsilon)
         log_prob = log_prob.sum(dim=-1, keepdim=True)
+        # Adjust for scaling from [-1,1] to [0,1] (Jacobian |0.5| per dim)
+        log_prob -= math.log(2.0) * action.shape[-1]
         
         return action, log_prob
     
     def deterministic_action(self, state):
         """Get deterministic action (mean of distribution, squashed)."""
         mean, _ = self.forward(state)
-        return torch.tanh(mean)
+        return 0.5 * (torch.tanh(mean) + 1.0)
 
 
 class SACAgent:
@@ -231,12 +234,8 @@ class SACAgent:
         
         # Epsilon-greedy exploration: random action with probability epsilon
         if apply_exploration and not deterministic and np.random.random() < self.epsilon:
-            # Random action, but bias toward forward motion
-            action = np.random.uniform(-1.0, 1.0, size=2)
-            # Bias: prefer positive actions (forward motion)
-            # Make left and right wheel more likely to be positive
-            if np.random.random() < 0.7:  # 70% chance of forward-biased action
-                action = np.clip(action + 0.3, -1.0, 1.0)
+            # Random forward-only action in [0, 1]
+            action = np.random.uniform(0.0, 1.0, size=2)
             action = torch.FloatTensor(action).unsqueeze(0)
         else:
             if deterministic:
@@ -246,13 +245,14 @@ class SACAgent:
                 with torch.no_grad():
                     action, _ = self.policy.sample(state_tensor)
             
-            # Add exploration noise (even when using policy)
+            # Add exploration noise (even when using policy) then clip to [0, 1]
             if apply_exploration and not deterministic:
                 noise = torch.randn_like(action) * self.exploration_noise
                 action = action + noise
+                action = torch.clamp(action, 0.0, 1.0)
         
-        # Clip action to valid range
-        action = torch.clamp(action, -1.0, 1.0)
+        # Clip action to valid forward-only range
+        action = torch.clamp(action, 0.0, 1.0)
         
         return action.cpu().numpy().flatten()
     
@@ -279,7 +279,7 @@ class SACAgent:
         
         # Update Q-networks
         with torch.no_grad():
-            # Sample next actions from policy
+            # Sample next actions from policy (already mapped to [0, 1])
             next_actions, next_log_probs = self.policy.sample(next_states)
             
             # Compute target Q-values using target networks
@@ -351,7 +351,7 @@ class SACAgent:
             target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
 
-def train_sac(num_episodes=1000, max_steps_per_episode=1000, 
+def train_sac(num_episodes=1500, max_steps_per_episode=1000, 
               batch_size=256, update_freq=1, save_freq=100,
               policy_checkpoint=None, q1_checkpoint=None, q2_checkpoint=None, start_episode=0):
     """
@@ -370,13 +370,23 @@ def train_sac(num_episodes=1000, max_steps_per_episode=1000,
     """
     
     # Create environment
-    env = DuckiematrixDB21JEnv(entity_name="map_0/vehicle_0")
+    env = DuckiematrixDB21JEnv(entity_name="map_0/vehicle_0", include_curve_flag=True)
     
     # Create agent
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    agent = SACAgent(obs_dim=2, action_dim=2, lr=3e-4, gamma=0.99, 
-                     tau=0.005, alpha=0.2, auto_alpha=True, device=device)
+    obs_dim = int(np.prod(env.observation_space.shape))
+    action_dim = int(np.prod(env.action_space.shape))
+    agent = SACAgent(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        lr=3e-4,
+        gamma=0.99,
+        tau=0.005,
+        alpha=0.2,
+        auto_alpha=True,
+        device=device,
+    )
     
     # Load checkpoint if provided
     if policy_checkpoint is not None:
@@ -412,11 +422,8 @@ def train_sac(num_episodes=1000, max_steps_per_episode=1000,
         for step in range(max_steps_per_episode):
             # Select action
             if total_steps < warmup_steps:
-                # Random action during warmup, but bias toward forward motion
+                # Random forward-only action during warmup
                 action = env.action_space.sample()
-                # Bias toward forward motion during warmup
-                if np.random.random() < 0.7:
-                    action = np.clip(action + 0.3, -1.0, 1.0)
             else:
                 action = agent.select_action(obs, deterministic=False, apply_exploration=True)
                 # Decay epsilon periodically
@@ -498,8 +505,8 @@ def train_sac(num_episodes=1000, max_steps_per_episode=1000,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train SAC agent on Duckiematrix environment')
-    parser.add_argument('--num_episodes', type=int, default=500,
-                        help='Number of episodes to train (default: 500)')
+    parser.add_argument('--num_episodes', type=int, default=1500,
+                        help='Number of episodes to train (default: 1500)')
     parser.add_argument('--max_steps_per_episode', type=int, default=2000,
                         help='Maximum steps per episode (default: 2000)')
     parser.add_argument('--batch_size', type=int, default=256,
