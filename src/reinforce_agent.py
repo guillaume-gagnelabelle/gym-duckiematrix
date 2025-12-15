@@ -14,7 +14,6 @@ import torch.optim as optim
 import numpy as np
 from collections import deque
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
-from duckietown.sdk.utils.loop_lane_position import get_closest_tile
 from time import sleep
 import math
 
@@ -225,15 +224,9 @@ def train_reinforce(num_episodes=1000, max_steps_per_episode=1000, save_freq=100
     print(f"Observation space: {env.observation_space}")
     print(f"Action space: {env.action_space}")
     
-    reset_tile = None  # Track tile for reset
-    
     for episode in range(num_episodes):
-        # Reset environment (to closest tile if previous episode terminated)
-        if reset_tile is not None:
-            obs, info = env.reset(tile=reset_tile)
-            reset_tile = None
-        else:
-            obs, info = env.reset()
+        # Always use random reset: 60% curved tiles, 40% straight tiles
+        obs, info = env.reset(curve_prob=0.6)
         
         agent.reset_episode()
         
@@ -264,16 +257,6 @@ def train_reinforce(num_episodes=1000, max_steps_per_episode=1000, save_freq=100
             done = terminated or truncated
             
             if done:
-                # Determine reset tile for next episode if terminated
-                if terminated:
-                    terminated_pos = info.get("terminated_position")
-                    if terminated_pos is None and last_pose is not None:
-                        terminated_pos = (last_pose["position"]["x"], last_pose["position"]["y"], 0.0)
-                    
-                    if terminated_pos is not None:
-                        x, y, _ = terminated_pos
-                        reset_tile = get_closest_tile(x, y)
-                
                 break
             
             obs = next_obs
@@ -307,7 +290,10 @@ def train_reinforce(num_episodes=1000, max_steps_per_episode=1000, save_freq=100
     print("Training complete! Model saved to reinforce_policy_final.pth")
     
     # Cleanup
-    env.robot.camera.stop()
+    try:
+        env.robot.camera.stop()
+    except:
+        pass  # Camera may not be started
     env.robot.motors.stop()
     
     return agent, episode_rewards, episode_lengths

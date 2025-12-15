@@ -307,6 +307,9 @@ class DuckiematrixDB21JEnv(gym.Env):
         self.last_forward_velocity = 0.0  # Reset forward velocity tracking
         self._last_lateral_offset = None
         # send teleport command to the simulator (if supported)
+        # clear any stale pose so we can wait for a fresh post-reset reading
+        self.robot.pose.capture()
+        
         header = Header(timestamp=float(0))
         position_msg = Position(header=header, x=float(x), y=float(y), z=0.0)
         rotation_msg = Quaternion(header=header, w=float(qw), x=0.0, y=0.0, z=float(qz))
@@ -318,14 +321,37 @@ class DuckiematrixDB21JEnv(gym.Env):
             position=position_msg,
             rotation=rotation_msg,
         )
+        
+        # Stop motors FIRST before resetting pose - important for clean reset
+        self.robot.motors.set_pwm(left=0.0, right=0.0)
+        
         if self.pose_reset_available:
             try:
                 self.robot.pose_reset.set_pose(teleport)
             except Exception as exc:
                 print(f"[WARN] pose_reset.set_pose failed (continuing without teleport): {exc}")
                 self.pose_reset_available = False
-        # try to grab a fresh pose after requesting the reset
-        new_pose = self.robot.pose.capture(block=True, timeout=0.5)
+        
+        # try to grab a fresh pose after requesting the reset; prefer one close to target
+        t_start = time.time()
+        new_pose = None
+        while time.time() - t_start < 0.5:
+            candidate = self.robot.pose.capture(block=True, timeout=0.1)
+            if candidate is None:
+                continue
+            cx, cy = candidate["position"]["x"], candidate["position"]["y"]
+            cyaw = compute_yaw(candidate)
+            close_pos = abs(cx - x) < 0.05 and abs(cy - y) < 0.05
+            yaw_diff = (cyaw - yaw + math.pi) % (2 * math.pi) - math.pi
+            close_yaw = abs(yaw_diff) < 0.05
+            if close_pos and close_yaw:
+                new_pose = candidate
+                break
+        
+        # fall back to any captured pose if no close match found
+        if new_pose is None:
+            new_pose = candidate if "candidate" in locals() else None
+        
         if new_pose is not None:
             self.last_pose = new_pose
             # Update last_position with actual reset position
@@ -356,7 +382,8 @@ class DuckiematrixDB21JEnv(gym.Env):
         obs_x, obs_y = self.last_position if self.last_position is not None else (x, y)
         obs_yaw = self.last_yaw if self.last_yaw is not None else yaw
         tile_id = get_closest_tile(obs_x, obs_y)
-        obs_vals = [compute_d(obs_x, obs_y), compute_theta(obs_x, obs_y, obs_yaw)]
+        # Use compute_d_signed instead of compute_d to match your friend's version
+        obs_vals = [compute_d_signed(obs_x, obs_y), compute_theta(obs_x, obs_y, obs_yaw)]
         if self.include_curve_flag:
             obs_vals.append(1.0 if tile_id in CURVED_TILES else 0.0)
         obs = np.array(obs_vals, dtype=np.float32)

@@ -15,7 +15,6 @@ import torch.optim as optim
 import numpy as np
 from collections import deque
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
-from duckietown.sdk.utils.loop_lane_position import get_closest_tile
 from time import sleep
 import math
 import argparse
@@ -160,9 +159,10 @@ class PPOAgent:
             action = np.random.uniform(-1.0, 1.0, size=2)
             if np.random.random() < 0.7:  # 70% chance of forward-biased action
                 action = np.clip(action + 0.3, -1.0, 1.0)
-            action = torch.FloatTensor(action).unsqueeze(0)
+            action = torch.FloatTensor(action).unsqueeze(0).to(self.device)
             # Create a dummy log_prob for storage (will be recomputed during update)
-            log_prob = torch.tensor(0.0)
+            # Must have same shape and device as policy log_prob: [1] not scalar, on correct device
+            log_prob = torch.tensor([0.0], device=self.device)
         else:
             # Get action distribution
             mean, std = self.policy(obs_tensor, min_std=self.min_std)
@@ -382,16 +382,11 @@ def train_ppo(num_episodes=1000, max_steps_per_episode=1000,
     print(f"Batch size: {batch_size}, Epochs per update: {agent.k_epochs}")
     print(f"Using value function: {use_value}")
     
-    reset_tile = None  # Track tile for reset
     total_steps = 0
     
     for episode in range(start_episode, start_episode + num_episodes):
-        # Reset environment (to closest tile if previous episode terminated)
-        if reset_tile is not None:
-            obs, info = env.reset(tile=reset_tile)
-            reset_tile = None
-        else:
-            obs, info = env.reset()
+        # Always use random reset: 60% curved tiles, 40% straight tiles
+        obs, info = env.reset(curve_prob=0.6)
         
         episode_reward = 0
         episode_length = 0
@@ -421,16 +416,6 @@ def train_ppo(num_episodes=1000, max_steps_per_episode=1000,
             
             # Check if episode is done
             if done:
-                # Determine reset tile for next episode if terminated
-                if terminated:
-                    terminated_pos = info.get("terminated_position")
-                    if terminated_pos is None and last_pose is not None:
-                        terminated_pos = (last_pose["position"]["x"], last_pose["position"]["y"], 0.0)
-                    
-                    if terminated_pos is not None:
-                        x, y, _ = terminated_pos
-                        reset_tile = get_closest_tile(x, y)
-                
                 break
             
             obs = next_obs
@@ -480,7 +465,10 @@ def train_ppo(num_episodes=1000, max_steps_per_episode=1000,
     print("Training complete! Model saved to ppo_policy_final.pth")
     
     # Cleanup
-    env.robot.camera.stop()
+    try:
+        env.robot.camera.stop()
+    except:
+        pass  # Camera may not be started
     env.robot.motors.stop()
     
     return agent, episode_rewards, episode_lengths

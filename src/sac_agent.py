@@ -16,11 +16,13 @@ import torch.optim as optim
 import numpy as np
 from collections import deque
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
-from duckietown.sdk.utils.loop_lane_position import get_closest_tile
+from gym_duckiematrix.DB21J_gym import DuckiematrixDB21JEnvGym
+from training_metrics import TrainingMetrics
 from time import sleep
 import math
 import argparse
 import random
+import time
 
 
 class ReplayBuffer:
@@ -203,21 +205,46 @@ class SACAgent:
             q1_path: Path to saved Q1 network state dict
             q2_path: Path to saved Q2 network state dict
         """
+        import os
+        
+        # Handle relative paths - check current directory, src/ directory, and checkpoints/ directory
+        def find_checkpoint(path):
+            if os.path.exists(path):
+                return path
+            # Try in src/ directory if running from root
+            src_path = os.path.join("src", path)
+            if os.path.exists(src_path):
+                return src_path
+            # Try in checkpoints/ directory
+            checkpoint_path = os.path.join("checkpoints", path)
+            if os.path.exists(checkpoint_path):
+                return checkpoint_path
+            # Try just the filename in checkpoints/ (in case full path was provided)
+            filename = os.path.basename(path)
+            checkpoint_path = os.path.join("checkpoints", filename)
+            if os.path.exists(checkpoint_path):
+                return checkpoint_path
+            return path  # Return original path to get proper error message
+        
         try:
+            policy_path = find_checkpoint(policy_path)
             self.policy.load_state_dict(torch.load(policy_path, map_location=self.device))
             print(f"Loaded policy checkpoint from {policy_path}")
             
             if q1_path is not None:
+                q1_path = find_checkpoint(q1_path)
                 self.q1.load_state_dict(torch.load(q1_path, map_location=self.device))
                 self.q1_target.load_state_dict(self.q1.state_dict())
                 print(f"Loaded Q1 checkpoint from {q1_path}")
             
             if q2_path is not None:
+                q2_path = find_checkpoint(q2_path)
                 self.q2.load_state_dict(torch.load(q2_path, map_location=self.device))
                 self.q2_target.load_state_dict(self.q2.state_dict())
                 print(f"Loaded Q2 checkpoint from {q2_path}")
         except FileNotFoundError as e:
             print(f"Error loading checkpoint: {e}")
+            print(f"Current working directory: {os.getcwd()}")
             raise
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
@@ -353,7 +380,9 @@ class SACAgent:
 
 def train_sac(num_episodes=1500, max_steps_per_episode=1000, 
               batch_size=256, update_freq=1, save_freq=100,
-              policy_checkpoint=None, q1_checkpoint=None, q2_checkpoint=None, start_episode=0):
+              policy_checkpoint=None, q1_checkpoint=None, q2_checkpoint=None, start_episode=0,
+              checkpoint_dir="checkpoints", use_gym_mode=False, step_duration=0.1,
+              metrics_dir="training_logs", save_metrics=True, hyperparams=None, hyperparams_file=None):
     """
     Train SAC agent on Duckiematrix environment.
     
@@ -367,31 +396,116 @@ def train_sac(num_episodes=1500, max_steps_per_episode=1000,
         q1_checkpoint: Path to Q1 checkpoint to load (for resuming training)
         q2_checkpoint: Path to Q2 checkpoint to load (for resuming training)
         start_episode: Starting episode number (for resuming training, affects save naming)
+        checkpoint_dir: Directory to save checkpoints (default: "checkpoints")
+        use_gym_mode: Whether to use gym mode (faster, non-real-time) (default: False)
+        step_duration: Step duration for gym mode in seconds (default: 0.1)
+        metrics_dir: Directory to save training metrics (default: "training_logs")
+        save_metrics: Whether to track and save training metrics (default: True)
+        hyperparams: Dictionary of hyperparameters (overrides defaults)
+        hyperparams_file: Path to JSON file containing hyperparameters (overrides defaults)
     """
+    import os
+    import json
     
-    # Create environment
-    env = DuckiematrixDB21JEnv(entity_name="map_0/vehicle_0", include_curve_flag=True)
+    # Load hyperparameters from file if provided
+    if hyperparams_file is not None:
+        with open(hyperparams_file, 'r') as f:
+            file_hyperparams = json.load(f)
+            if hyperparams is None:
+                hyperparams = file_hyperparams
+            else:
+                hyperparams.update(file_hyperparams)
+    
+    # Default hyperparameters
+    default_hyperparams = {
+        'lr': 3e-4,
+        'gamma': 0.99,
+        'tau': 0.005,
+        'alpha': 0.2,
+        'auto_alpha': True,
+        'hidden_dim': 256,
+        'exploration_noise': 0.1,
+        'epsilon_start': 0.5,
+        'epsilon_end': 0.05,
+        'epsilon_decay': 0.995,
+    }
+    
+    # Merge with provided hyperparameters
+    if hyperparams is not None:
+        default_hyperparams.update(hyperparams)
+    hyperparams = default_hyperparams
+    
+    # Create checkpoint directory if it doesn't exist
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}/")
+    
+    # Initialize metrics tracker
+    metrics = None
+    if save_metrics:
+        metrics = TrainingMetrics(save_dir=metrics_dir)
+        config = {
+            "num_episodes": num_episodes,
+            "max_steps_per_episode": max_steps_per_episode,
+            "batch_size": batch_size,
+            "update_freq": update_freq,
+            "save_freq": save_freq,
+            "start_episode": start_episode,
+            "use_gym_mode": use_gym_mode,
+            "step_duration": step_duration,
+            "checkpoint_dir": checkpoint_dir,
+            "hyperparams": hyperparams,
+        }
+        metrics.start_training(config)
+    
+    # Create environment (gym mode or regular mode)
+    if use_gym_mode:
+        print(f"Using GYM MODE (step_duration={step_duration}s)")
+        env = DuckiematrixDB21JEnvGym(
+            entity_name="map_0/vehicle_0", 
+            include_curve_flag=True,
+            step_duration=step_duration
+        )
+    else:
+        print("Using REGULAR MODE (real-time)")
+        env = DuckiematrixDB21JEnv(entity_name="map_0/vehicle_0", include_curve_flag=True)
     
     # Create agent
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
+    
+    print(f"Hyperparameters: {json.dumps(hyperparams, indent=2)}")
+    
     agent = SACAgent(
         obs_dim=obs_dim,
         action_dim=action_dim,
-        lr=3e-4,
-        gamma=0.99,
-        tau=0.005,
-        alpha=0.2,
-        auto_alpha=True,
+        lr=hyperparams['lr'],
+        gamma=hyperparams['gamma'],
+        tau=hyperparams['tau'],
+        alpha=hyperparams['alpha'],
+        auto_alpha=hyperparams['auto_alpha'],
         device=device,
+        hidden_dim=hyperparams['hidden_dim'],
+        exploration_noise=hyperparams['exploration_noise'],
+        epsilon_start=hyperparams['epsilon_start'],
+        epsilon_end=hyperparams['epsilon_end'],
+        epsilon_decay=hyperparams['epsilon_decay'],
     )
     
     # Load checkpoint if provided
     if policy_checkpoint is not None:
+        print(f"Loading checkpoint: {policy_checkpoint}")
         agent.load_checkpoint(policy_checkpoint, q1_checkpoint, q2_checkpoint)
         print(f"Resuming training from episode {start_episode}")
+        
+        # Verify observation space compatibility
+        loaded_policy_obs_dim = agent.policy.fc1.in_features
+        if loaded_policy_obs_dim != obs_dim:
+            print(f"WARNING: Observation dimension mismatch!")
+            print(f"  Checkpoint expects obs_dim={loaded_policy_obs_dim}")
+            print(f"  Environment provides obs_dim={obs_dim}")
+            print(f"  This may cause errors. Make sure checkpoint matches environment configuration.")
     
     # Training statistics
     episode_rewards = []
@@ -403,23 +517,29 @@ def train_sac(num_episodes=1500, max_steps_per_episode=1000,
     print(f"Batch size: {batch_size}, Update frequency: {update_freq}")
     print(f"Auto-tuning alpha: {agent.auto_alpha}")
     
-    reset_tile = None  # Track tile for reset
     total_steps = 0
     warmup_steps = 1000  # Collect some experience before updating
     
+    # Track losses for metrics
+    last_q1_loss = None
+    last_q2_loss = None
+    last_policy_loss = None
+    last_alpha_loss = None
+    
     for episode in range(start_episode, start_episode + num_episodes):
-        # Reset environment (to closest tile if previous episode terminated)
-        if reset_tile is not None:
-            obs, info = env.reset(tile=reset_tile)
-            reset_tile = None
-        else:
-            obs, info = env.reset()
+        # Start episode tracking
+        if metrics:
+            metrics.start_episode(episode)
+        
+        # Always use random reset: 60% curved tiles, 40% straight tiles
+        obs, info = env.reset(curve_prob=0.6)
         
         episode_reward = 0
         episode_length = 0
         last_pose = None
         
         for step in range(max_steps_per_episode):
+            step_start_time = time.perf_counter()
             # Select action
             if total_steps < warmup_steps:
                 # Random forward-only action during warmup
@@ -445,59 +565,105 @@ def train_sac(num_episodes=1500, max_steps_per_episode=1000,
             if not terminated:
                 last_pose = info.get("pose")
             
+            # Record step metrics (for every step)
+            step_time = time.perf_counter() - step_start_time
+            if metrics:
+                alpha_val = agent.alpha.item() if isinstance(agent.alpha, torch.Tensor) else agent.alpha
+                metrics.record_step_metrics(
+                    reward=reward,
+                    q1_loss=last_q1_loss,
+                    q2_loss=last_q2_loss,
+                    policy_loss=last_policy_loss,
+                    alpha_loss=last_alpha_loss,
+                    alpha_value=alpha_val,
+                    buffer_size=len(agent.replay_buffer),
+                    step_time=step_time
+                )
+            
             # Update networks
             if total_steps >= warmup_steps and total_steps % update_freq == 0:
                 q1_loss, q2_loss, policy_loss, alpha_loss = agent.update(batch_size)
+                last_q1_loss = q1_loss
+                last_q2_loss = q2_loss
+                last_policy_loss = policy_loss
+                last_alpha_loss = alpha_loss
             
             # Check if episode is done
             if done:
-                # Determine reset tile for next episode if terminated
-                if terminated:
-                    terminated_pos = info.get("terminated_position")
-                    if terminated_pos is None and last_pose is not None:
-                        terminated_pos = (last_pose["position"]["x"], last_pose["position"]["y"], 0.0)
-                    
-                    if terminated_pos is not None:
-                        x, y, _ = terminated_pos
-                        reset_tile = get_closest_tile(x, y)
-                
                 break
             
             obs = next_obs
-            sleep(0.01)  # Small delay to prevent overwhelming the simulator
+            # Only sleep in regular mode (gym mode handles timing internally)
+            if not use_gym_mode:
+                sleep(0.01)  # Small delay to prevent overwhelming the simulator
         
         # Store statistics
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
         
-        # Print progress
+        # Record episode metrics
         episode_num = episode + 1
+        if metrics:
+            losses = {}
+            if last_q1_loss is not None:
+                losses['q1_loss'] = last_q1_loss
+            if last_q2_loss is not None:
+                losses['q2_loss'] = last_q2_loss
+            if last_policy_loss is not None:
+                losses['policy_loss'] = last_policy_loss
+            if last_alpha_loss is not None:
+                losses['alpha_loss'] = last_alpha_loss
+            
+            metrics.end_episode(episode_num, episode_reward, episode_length, losses)
+        
+        # Print progress every 10 episodes
         if episode_num % 10 == 0:
-            avg_reward = np.mean(episode_rewards[-10:])
-            avg_length = np.mean(episode_lengths[-10:])
+            avg_reward = np.mean(episode_rewards[-10:]) if len(episode_rewards) >= 10 else np.mean(episode_rewards)
+            avg_length = np.mean(episode_lengths[-10:]) if len(episode_lengths) >= 10 else np.mean(episode_lengths)
             buffer_size = len(agent.replay_buffer)
             alpha_val = agent.alpha.item() if isinstance(agent.alpha, torch.Tensor) else agent.alpha
             print(f"Episode {episode_num}/{start_episode + num_episodes} | "
-                  f"Avg Reward: {avg_reward:.2f} | "
-                  f"Avg Length: {avg_length:.1f} | "
+                  f"Reward: {episode_reward:.2f} | "
+                  f"Avg Reward (last 10): {avg_reward:.2f} | "
+                  f"Length: {episode_length} | "
+                  f"Avg Length (last 10): {avg_length:.1f} | "
                   f"Buffer Size: {buffer_size} | "
                   f"Alpha: {alpha_val:.4f}")
+            import sys
+            sys.stdout.flush()  # Ensure output is printed immediately
         
         # Save model periodically
         if episode_num % save_freq == 0:
-            torch.save(agent.policy.state_dict(), f"sac_policy_ep{episode_num}.pth")
-            torch.save(agent.q1.state_dict(), f"sac_q1_ep{episode_num}.pth")
-            torch.save(agent.q2.state_dict(), f"sac_q2_ep{episode_num}.pth")
-            print(f"Saved model at episode {episode_num}")
+            policy_path = os.path.join(checkpoint_dir, f"sac_policy_ep{episode_num}.pth")
+            q1_path = os.path.join(checkpoint_dir, f"sac_q1_ep{episode_num}.pth")
+            q2_path = os.path.join(checkpoint_dir, f"sac_q2_ep{episode_num}.pth")
+            torch.save(agent.policy.state_dict(), policy_path)
+            torch.save(agent.q1.state_dict(), q1_path)
+            torch.save(agent.q2.state_dict(), q2_path)
+            print(f"Saved model at episode {episode_num} to {checkpoint_dir}/")
     
     # Final save
-    torch.save(agent.policy.state_dict(), "sac_policy_final.pth")
-    torch.save(agent.q1.state_dict(), "sac_q1_final.pth")
-    torch.save(agent.q2.state_dict(), "sac_q2_final.pth")
-    print("Training complete! Model saved to sac_*_final.pth")
+    policy_path = os.path.join(checkpoint_dir, "sac_policy_final.pth")
+    q1_path = os.path.join(checkpoint_dir, "sac_q1_final.pth")
+    q2_path = os.path.join(checkpoint_dir, "sac_q2_final.pth")
+    torch.save(agent.policy.state_dict(), policy_path)
+    torch.save(agent.q1.state_dict(), q1_path)
+    torch.save(agent.q2.state_dict(), q2_path)
+    print(f"Training complete! Model saved to {checkpoint_dir}/sac_*_final.pth")
+    
+    # Save and plot metrics
+    if metrics:
+        metrics.end_training()
+        metrics.save_metrics()
+        print("Generating training plots...")
+        metrics.plot_all(save_plots=True, show_plots=False)
+        print(f"Training metrics and plots saved to: {metrics_dir}/")
     
     # Cleanup
-    env.robot.camera.stop()
+    try:
+        env.robot.camera.stop()
+    except:
+        pass  # Camera may not be started
     env.robot.motors.stop()
     
     return agent, episode_rewards, episode_lengths
@@ -523,6 +689,18 @@ if __name__ == "__main__":
                         help='Path to Q2 checkpoint to load (for resuming training)')
     parser.add_argument('--start_episode', type=int, default=0,
                         help='Starting episode number (for resuming training, affects save naming)')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='Directory to save checkpoints (default: checkpoints)')
+    parser.add_argument('--gym_mode', action='store_true',
+                        help='Use gym mode (faster, non-real-time simulation)')
+    parser.add_argument('--step_duration', type=float, default=0.1,
+                        help='Step duration for gym mode in seconds (default: 0.1)')
+    parser.add_argument('--metrics_dir', type=str, default='training_logs',
+                        help='Directory to save training metrics (default: training_logs)')
+    parser.add_argument('--no_metrics', action='store_true',
+                        help='Disable metrics tracking and plotting')
+    parser.add_argument('--hyperparams_file', type=str, default=None,
+                        help='Path to JSON file containing hyperparameters (default: None)')
     
     args = parser.parse_args()
     
@@ -536,6 +714,11 @@ if __name__ == "__main__":
         policy_checkpoint=args.policy_checkpoint,
         q1_checkpoint=args.q1_checkpoint,
         q2_checkpoint=args.q2_checkpoint,
-        start_episode=args.start_episode
+        start_episode=args.start_episode,
+        checkpoint_dir=args.checkpoint_dir,
+        use_gym_mode=args.gym_mode,
+        step_duration=args.step_duration,
+        metrics_dir=args.metrics_dir,
+        save_metrics=not args.no_metrics,
+        hyperparams_file=args.hyperparams_file
     )
-
