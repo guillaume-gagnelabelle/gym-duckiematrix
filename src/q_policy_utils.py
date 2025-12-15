@@ -38,3 +38,20 @@ def print_policy(Q, dims):
 def discretizer(observation, bin_finder):
     d, theta, in_curve = observation[:]
     return tuple(map(int, bin_finder.transform([[d, theta, in_curve]])[0]))
+
+def save_info(x_train, x_test, y_train_mean, y_train_std, y_test, dist_train_mean, dist_train_std, dist_test, time_test, DELAY):
+    info = {}
+    info["x_train"] = x_train
+    info["x_test"] = x_test
+
+    info["y_train_mean"] = y_train_mean
+    info["y_train_std"] = y_train_std
+    info["y_test"] = y_test
+
+    info["dist_train_mean"] = dist_train_mean
+    info["dist_train_std"] = dist_train_std
+    info["dist_test"] = dist_test
+
+    info["episode_time"] = time_test
+
+    np.save("experiment_delay%d_t05"%(DELAY), info)

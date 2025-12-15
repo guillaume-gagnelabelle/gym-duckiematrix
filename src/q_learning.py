@@ -4,6 +4,7 @@ from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 import matplotlib.pyplot as plt
 from q_learning_utils import *
 from q_policy_utils import *
+from time import time, ctime
 
 """
  * @author Guillaume Gagné-Labelle, Gabriel Sasseville, Nico Bosteels
@@ -13,8 +14,6 @@ from q_policy_utils import *
  * @description: This file is the main loop of the algorithm. It's mostly there to gather training and testing data
  *              rather than implementing any RL logic.
 """
-
-DELAY = 0
 
 # This should be elsewhere
 tile_size = 0.585
@@ -30,7 +29,10 @@ args_form.add_argument('--test', action="store_true", default=False)
 args_form.add_argument('--load_policy', type=str)
 #args_form.add_argument("--seeds", type=int, nargs="+", default=[0,1,2,3,4,5,6,7,8,9])
 args_form.add_argument("--seeds", type=int, nargs='+', default=[0])
+args_form.add_argument("--delay", type=int, default=0, choices=list(range(10)), help="Which buffered observation (0=newest, 9=oldest) to use for action selection.")
 args = args_form.parse_args()
+
+DELAY = args.delay
 
 for seed in args.seeds:
 
@@ -65,11 +67,20 @@ for seed in args.seeds:
 
     print("---------------------- SEED %d BEGINNING -------------------" % seed)
 
-    n_episodes = 2500
+    n_episodes = 500
     for e in range(n_episodes + 1):
-        info_msg = "\nEpisode: %d\n" % e
+        info_msg = "\nEpisode: %d, Total time: %.2f\n" % (e, time() - experiment_starting_time)
         if not args.test:
-            Q_table, train_reward, train_distance = episode(args=args, env=env, Q_table=Q_table, episode=e, bin_finder=bin_finder, n_actions=n_actions, testing=False)
+            Q_table, train_reward, train_distance = episode(
+                args=args,
+                env=env,
+                Q_table=Q_table,
+                episode=e,
+                bin_finder=bin_finder,
+                n_actions=n_actions,
+                testing=False,
+                delay=DELAY,
+            )
             y_train.append(train_reward)
             dist_train.append(train_distance)
             if e % 5 == 0:
@@ -84,16 +95,26 @@ for seed in args.seeds:
 
             if e % 100 == 0:
                 np.save("Q_intermediate", Q_table)
+                save_info(x_train, x_test, y_train_mean, y_train_std, y_test, dist_train_mean, dist_train_std, dist_test, time_test, DELAY)
                 print_policy(Q_table, n_bins)
             if e == n_episodes:
-                np.save("Q_advanced", Q_table)
+                np.save(f"Q_{DELAY}x05", Q_table)
         else:
             y_train = [0]
             dist_train = [0]
 
         if e % 25 == 0:
             episode_start_time = time()
-            _, test_reward, test_distance = episode(args=args, env=env, Q_table=Q_table, episode=e, bin_finder=bin_finder, n_actions=n_actions, testing=True)
+            _, test_reward, test_distance = episode(
+                args=args,
+                env=env,
+                Q_table=Q_table,
+                episode=e,
+                bin_finder=bin_finder,
+                n_actions=n_actions,
+                testing=True,
+                delay=DELAY,
+            )
             episode_end_time = time()
             x_test.append(e)
             y_test.append(test_reward)
@@ -102,59 +123,11 @@ for seed in args.seeds:
 
             info_msg += "\nTesting reward: %.2f" % test_reward
             info_msg += " | Testing distance: %.2f" % test_distance
+            info_msg += " | Episode time: %.2f" % (time_test[-1])
 
         if e % 5 == 0:
             print(info_msg)
             y_train = []
             dist_train = []
 
-
-    info = {}
-    info["x_train"] = x_train
-    info["x_test"] = x_test
-
-    info["y_train_mean"] = y_train_mean
-    info["y_train_std"] = y_train_std
-    info["y_test"] = y_test
-
-    info["dist_train_mean"] = dist_train_mean
-    info["dist_train_std"] = dist_train_std
-    info["dist_test"] = dist_test
-
-    info["episode_time"] = time_test
-
-    np.save("experiment_%.2f_info"%(DELAY), info)
-
-'''
-    if not args.test:
-        y_train_mean = np.array(y_train_mean)
-        y_train_std = np.array(y_train_std)
-        plt.plot(x_train, y_train_mean, label="Entraînement")
-        plt.fill_between(x_train, y_train_mean-y_train_std, y_train_mean+y_train_std, alpha=0.3)
-
-    plt.plot(x_test, y_test, label="Évaluation")
-
-    plt.title("Performance d'un agent")
-    plt.xlabel("Épisode")
-    plt.ylabel("Récompense")
-    plt.legend()
-    plt.grid()
-    plt.show()
-
-    plt.figure()
-    if not args.test:
-        dist_train_mean = np.array(dist_train_mean)
-        dist_train_std = np.array(dist_train_std)
-        plt.plot(x_train, dist_train_mean, label="Entraînement")
-        plt.fill_between(x_train, dist_train_mean-dist_train_std, dist_train_mean+dist_train_std, alpha=0.3)
-
-    plt.plot(x_test, dist_test, label="Évaluation")
-
-    plt.title("Performance d'un agent")
-    plt.xlabel("Épisode")
-    plt.ylabel("Distance")
-    plt.legend()
-    plt.grid()
-    plt.show()
     print("----------------------- SEED %d END ------------------------" % seed)
-'''
